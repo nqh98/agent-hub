@@ -792,46 +792,41 @@ function tasksDir(on: On) {
   return files
 }
 
-test('a running shell pins its command over its log; the next command takes its place', async ($, on) => {
+test("the main conversation's foreground commands are the transcript's, not a shell", async ($, on) => {
   const { clock } = engine(on)
-  const files = tasksDir(on)
-  files['bold.output'] = { text: 'from before\n', mtimeMs: 1 }
-  const calls: Record<string, () => void> = {}
-  on('tool.call', async (_$, e) => {
-    const id = String(e.tool_use_id)
-    await new Promise<void>(resolve => (calls[id] = resolve))
-
-    return { result: { stdout: id === 'u1' ? 'compiled\n3 passed\n' : 'clean', stderr: '', interrupted: false }, text: 'ok' }
-  })
+  tasksDir(on)
+  on('tool.call', () => ({ result: { stdout: 'clean', stderr: '', interrupted: false }, text: 'clean' }))
   const ui = await $.ui.mount({ plugin: 'agent-hub', surface: 'terminal', component: 'Pane', requestId: 'agent-hub', props: PANE_PROPS })
 
-  const first = $.tool.call({ tool: 'Bash', command: 'npm test', description: 'Run the tests', tool_use_id: 'u1' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'git status', tool_use_id: 'u1' } as never)
+  await clock.advance(2000)
   await clock.settle()
-  files['bfirst.output'] = { text: 'compiled\n\x1b[32m2 passed\x1b[0m\n', mtimeMs: 2_000_000 }
+  expect(await ui.find({ type: 'Text', text: /^Shells/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'git status' })).toBeUndefined()
+
+  await ui.unmount()
+})
+
+test('a command moved to the background mid-run becomes a shell, its log found in the tasks dir', async ($, on) => {
+  const { clock } = engine(on)
+  const files = tasksDir(on)
+  on('tool.call', () => ({
+    result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bbuild', backgroundedByUser: true },
+    text: 'Command was manually backgrounded by user with ID: bbuild.',
+  }))
+  const ui = await $.ui.mount({ plugin: 'agent-hub', surface: 'terminal', component: 'Pane', requestId: 'agent-hub', props: PANE_PROPS })
+
+  await $.tool.call({ tool: 'Bash', command: 'npm run build', description: 'Build the app', tool_use_id: 'u1' } as never)
+  files['bbuild.output'] = { text: 'compiled\n\x1b[32m12 modules\x1b[0m\n', mtimeMs: 2_000_000 }
   await clock.advance(2000)
   await clock.settle()
 
   expect(await ui.find({ type: 'Text', text: /^Shells: 1 running · 0 done$/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: ' Run the tests' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'npm test' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '2 passed' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'from before' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: ' Build the app' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'npm run build' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '12 modules' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^main · / })).toBeDefined()
 
-  calls.u1!()
-  await first
-  delete files['bfirst.output']
-  await clock.settle()
-  expect(await ui.find({ type: 'Text', text: '3 passed' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^Shells: 0 running · 1 done$/ })).toBeDefined()
-
-  const second = $.tool.call({ tool: 'Bash', command: 'git status', tool_use_id: 'u2' } as never)
-  await clock.settle()
-  expect(await ui.find({ type: 'Text', text: 'git status' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'npm test' })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: 'waiting for output…' })).toBeDefined()
-
-  calls.u2!()
-  await second
   await ui.unmount()
 })
 
@@ -851,7 +846,7 @@ test("a background shell runs until its log's exit line, under the agent that st
   await clock.advance(2000)
   await clock.settle()
   expect(await ui.find({ type: 'Text', text: 'ready on :3000' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^Explore · bg · / })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Explore · / })).toBeDefined()
 
   files['bsrv.output'] = { text: 'ready on :3000\nEADDRINUSE\n\n[exited with code 1]\n', mtimeMs: 2_001_000 }
   await clock.advance(2000)

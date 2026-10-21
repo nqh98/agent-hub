@@ -118,22 +118,22 @@ export type CacheReading = {
   write: number
 }
 
-export type ShellStatus ='running' | 'done' | 'failed' | 'stopped'
-/** One Bash command an agent ran: the command pinned, its log's latest lines under it. */
+export type ShellStatus = 'running' | 'done' | 'failed' | 'stopped'
+/** A shell the session spawned: a Bash command left running in the background, its log watched. */
 export type ShellRow = {
   /** The call's tool_use_id. */
   id: string
   command: string
   description?: string
-  /** The subagent that ran it; absent for the main conversation. */
+  /** The subagent that spawned it; absent for the main conversation. */
   agentId?: string
-  /** The prompt it ran under (the `task` count). */
+  /** The prompt it was spawned under (the `task` count). */
   task: number
   status: ShellStatus
-  /** Run in the background, or moved there (Ctrl+B, a timeout). */
-  isBackground: boolean
-  /** The engine's id for the command, `b…`: its log is `<tasks dir>/<taskId>.output`. */
-  taskId?: string
+  /** The engine's id for the command, `b…`. */
+  taskId: string
+  /** Its log, as the call's result named it; absent, `<tasks dir>/<taskId>.output`. */
+  logPath?: string
   startedAt: number
   endedAt?: number
   exitCode?: number
@@ -168,7 +168,7 @@ declare module 'claude-code' {
       sessionCostUsd: number | null
       /** The account's rate-limit windows, five hours first; empty off a subscription or before a reading. */
       rateLimits: RateLimitRow[]
-      /** The session's Bash commands, oldest first: the latest MAX_SHELLS, every running one kept. */
+      /** The shells the session spawned, oldest first: the latest MAX_SHELLS, every running one kept. */
       shells: ShellRow[]
       /** The person's prompts so far, counted: each one starts a task. */
       task: number

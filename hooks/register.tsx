@@ -48,19 +48,15 @@ import {
   visibleTree,
 } from './roster'
 import {
-  claimFiles,
   clip,
   commandLine,
   DONE_TAIL_LINES,
-  endStatus,
-  finalOutput,
   MAX_LOG_BYTES,
   patchRunning,
   readLog,
-  shellFiles,
+  spawnedOf,
   startShell,
   TAIL_LINES,
-  toBackground,
   visibleShells,
 } from './shells'
 import {
@@ -143,8 +139,8 @@ const shells = atom({ plugin: 'agent-hub', key: 'shells' } as const, [])
 // folds to one line, and the detail view lists them all.
 const CARD_STEPS = 3
 const CARD_TASK_STEPS = 3
-// The shells' logs are read every SHELL_EVERY ticks while one runs; the
-// tasks dir is looked for again every SCAN_EVERY polls until found.
+// The spawned shells' logs are read every SHELL_EVERY ticks while one runs;
+// the tasks dir, when needed, is looked for every SCAN_EVERY polls until found.
 const SHELL_EVERY = 2
 const SCAN_EVERY = 8
 // The size the pane asks for: columns docked beside a fullscreen transcript,
@@ -220,11 +216,9 @@ const openKey = (id: string) => `open:${id}`
 const childKey = (id: string) => `child:${id}`
 
 let ticks = 0
-// Where the engine writes the session's command logs, once found, and the
-// log files already given out or passed over. The module's own: a reload
-// looks again.
+// Where the engine writes the session's command logs, when a result did not
+// name a shell's own. The module's own: a reload looks again.
 let tasksDir: string | undefined
-let seenFiles: ReadonlySet<string> = new Set()
 let polls = 0
 
 const sanitize = (path: string) => path.replace(/[^a-zA-Z0-9]/g, '-')
@@ -251,50 +245,21 @@ async function findTasksDir($: EngineInterface): Promise<string | undefined> {
   return undefined
 }
 
-// Found: the logs there before any shell now waiting began are someone else's.
-async function useTasksDir($: EngineInterface, dir: string) {
-  if (tasksDir === dir) return
-  tasksDir = dir
-  const waiting = (await read($, shells)).filter(one => one.status === 'running' && one.taskId === undefined)
-  const since = Math.min(await $.clock.now(), ...waiting.map(one => one.startedAt))
-  const entries = await $.fs.list(dir).catch(() => [])
-  seenFiles = new Set([...seenFiles, ...shellFiles(entries, since)])
-}
-
-// Reads each running shell's log, when it grew, and gives new logs to the shells waiting for one.
+// Reads each running shell's log when it grew; the log's exit line ends the shell.
 async function pollShells($: EngineInterface) {
-  const before = await read($, shells)
-  if (!before.some(one => one.status === 'running')) return
-  if (tasksDir === undefined) {
-    if (polls++ % SCAN_EVERY !== 0) return
-    const found = await findTasksDir($)
-    if (found === undefined) return
-    await useTasksDir($, found)
+  const running = (await read($, shells)).filter(one => one.status === 'running')
+  if (running.length === 0) return
+  if (tasksDir === undefined && running.some(one => one.logPath === undefined) && polls++ % SCAN_EVERY === 0) {
+    tasksDir = await findTasksDir($)
   }
-  const dir = tasksDir!
-  let list = before
-  if (list.some(one => one.status === 'running' && !one.isBackground && one.taskId === undefined)) {
-    const entries = await $.fs.list(dir).catch(() => undefined)
-    if (entries !== undefined) {
-      const claimed = claimFiles(list, shellFiles(entries), seenFiles)
-      seenFiles = claimed.seen
-      if (claimed.shells.some((one, i) => one.taskId !== list[i]?.taskId)) {
-        const given = new Map(claimed.shells.map(one => [one.id, one.taskId]))
-        list = await update($, shells, rows =>
-          rows.map(one => (one.taskId === undefined && given.get(one.id) !== undefined ? { ...one, taskId: given.get(one.id) } : one)),
-        )
-      }
-    }
-  }
-  for (const row of list) {
-    if (row.status !== 'running' || row.taskId === undefined) continue
-    const path = `${dir}/${row.taskId}.output`
+  for (const row of running) {
+    const path = row.logPath ?? (tasksDir === undefined ? undefined : `${tasksDir}/${row.taskId}.output`)
+    if (path === undefined) continue
     const stat = await $.fs.stat(path).catch(() => undefined)
     const t = await $.clock.now()
-    // A foreground log goes as its command ends, the result telling how; a
-    // background one gone is a command stopped.
+    // The log gone with no exit line: the command was stopped.
     if (stat === undefined) {
-      if (row.isBackground) await update($, shells, rows => patchRunning(rows, row.id, { status: 'stopped', endedAt: t }))
+      await update($, shells, rows => patchRunning(rows, row.id, { status: 'stopped', endedAt: t }))
       continue
     }
     if (stat.size === row.size) continue
@@ -305,36 +270,11 @@ async function pollShells($: EngineInterface) {
     }
     const text = await $.fs.read(path).catch(() => undefined)
     if (typeof text !== 'string') continue
-    const log = readLog(text)
-    const exitCode = row.isBackground ? log.exitCode : undefined
+    const { tail, exitCode } = readLog(text)
     const end: Partial<ShellRow> =
       exitCode === undefined ? {} : { status: exitCode === 0 ? 'done' : 'failed', exitCode, endedAt: t }
-    await update($, shells, rows => patchRunning(rows, row.id, { tail: log.tail, size: stat.size, ...end }))
+    await update($, shells, rows => patchRunning(rows, row.id, { tail, size: stat.size, ...end }))
   }
-}
-
-// A command's call settled: moved to the background it keeps running under
-// the id the result gives; otherwise it ended, its output the result's own.
-async function settleShell($: EngineInterface, id: string, ran: ToolCallResult) {
-  const record = typeof ran.result === 'object' && ran.result !== null ? (ran.result as Record<string, unknown>) : {}
-  const taskId = typeof record.backgroundTaskId === 'string' ? record.backgroundTaskId : undefined
-  if (taskId !== undefined && ran.deny === undefined) {
-    const named = /(\/\S+)\/b[a-z0-9]+\.output/.exec(ran.text ?? '')?.[1]
-    if (named !== undefined && tasksDir === undefined) await useTasksDir($, named)
-    await update($, shells, rows => toBackground(rows, id, taskId))
-
-    return
-  }
-  const t = await $.clock.now()
-  const { output, exitCode } = finalOutput(ran.result, ran.text)
-  const { tail } = readLog(output)
-  const status = endStatus(ran)
-  const code = exitCode ?? (status === 'done' ? 0 : undefined)
-  await update($, shells, rows =>
-    rows.map(one =>
-      one.id === id ? { ...one, status, endedAt: t, exitCode: code, tail: tail.length > 0 ? tail : one.tail } : one,
-    ),
-  )
 }
 
 // Reads the engine's roster and folds it in, writing only on a change so an
@@ -464,12 +404,6 @@ export const register: Register = on => {
       })
       .catch(() => undefined)
     void $.ui.open({ id: PANE, title: TITLE, ...OPEN_SIZE })
-    // A foreground command running when the mod reloaded has no result to
-    // come: it is over as far as the pane can tell. A background one keeps its log.
-    const reloadedAt = await $.clock.now()
-    await update($, shells, list =>
-      list.map(one => (one.status === 'running' && !one.isBackground ? { ...one, status: 'stopped' as const, endedAt: reloadedAt } : one)),
-    ).catch(() => undefined)
     $.clock.every(TICK_MS, () => void tick($).catch(() => undefined))
     // The checklist as it stands when the mod loads; each plan call keeps it current after.
     void $.tool
@@ -576,34 +510,27 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // Every Bash call, the main conversation's and each subagent's, is a shell
-  // in the pane. The watching fails quietly; the call's own failure is the call's.
+  // A Bash call that leaves its command running in the background, the main
+  // conversation's or a subagent's, spawned a shell: the pane watches its log
+  // as it watches a subagent. A foreground command is the transcript's.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const t = await $.clock.now().catch(() => 0)
-    const id = e.tool_use_id ?? `shell:${t}`
-    const row: ShellRow = {
-      id,
-      command: String(e.command ?? ''),
-      description: typeof e.description === 'string' && e.description !== '' ? e.description : undefined,
-      agentId: e.agentId,
-      task: await read($, task).catch(() => 0),
-      status: 'running',
-      isBackground: e.run_in_background === true,
-      startedAt: t,
-      tail: [],
+    const ran = await next(e)
+    const spawned = ran.deny === undefined ? spawnedOf(ran.result, ran.text) : undefined
+    if (spawned !== undefined) {
+      const row: ShellRow = {
+        id: e.tool_use_id ?? spawned.taskId,
+        command: String(e.command ?? ''),
+        description: typeof e.description === 'string' && e.description !== '' ? e.description : undefined,
+        agentId: e.agentId,
+        task: await read($, task).catch(() => 0),
+        status: 'running',
+        ...spawned,
+        startedAt: t,
+        tail: [],
+      }
+      await update($, shells, list => startShell(list, row)).catch(() => undefined)
     }
-    await update($, shells, list => startShell(list, row)).catch(() => undefined)
-    // The tasks dir not found yet: the next poll looks for it.
-    if (tasksDir === undefined) polls = 0
-    let ran: ToolCallResult
-    try {
-      ran = await next(e)
-    } catch (error) {
-      const ended = await $.clock.now().catch(() => t)
-      await update($, shells, list => patchRunning(list, id, { status: 'stopped', endedAt: ended })).catch(() => undefined)
-      throw error
-    }
-    await settleShell($, id, ran).catch(() => undefined)
 
     return ran
   })
@@ -1237,9 +1164,9 @@ export const register: Register = on => {
         </Text>
       )
 
-    // The shells: one terminal a lane, its command pinned on top, its log's
-    // latest lines under it, as a terminal scrolls; the lane's next command
-    // takes its place. A running card keeps its height as its log grows.
+    // The spawned shells, one card each: the command pinned on top, its log's
+    // latest lines under it as a terminal scrolls. A running card keeps its
+    // height as its log grows.
     const shownShells = visibleShells(shellRows, currentPrompt)
     const shellsRunning = shellRows.filter(one => one.status === 'running').length
     const shellTime = (one: ShellRow) => formatElapsed(Math.max(0, (one.endedAt ?? Math.max(t, one.startedAt)) - one.startedAt))
@@ -1277,7 +1204,7 @@ export const register: Register = on => {
           { text: isRunning ? frame : SHELL_GLYPH[one.status], color: SHELL_COLOR[one.status] },
           { text: ` ${one.description ?? 'shell'}`, color: 'text', bold: isRunning },
         ]),
-        right: dimmed([{ text: `${owner}${one.isBackground ? ' · bg' : ''} · ${shellTime(one)}${end}`, color: 'text' }]),
+        right: dimmed([{ text: `${owner} · ${shellTime(one)}${end}`, color: 'text' }]),
       }
 
       return (

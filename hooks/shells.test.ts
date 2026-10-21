@@ -1,26 +1,14 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import type { ShellRow } from '../types'
-import {
-  claimFiles,
-  clip,
-  commandLine,
-  endStatus,
-  finalOutput,
-  MAX_SHELLS,
-  readLog,
-  shellFiles,
-  startShell,
-  toBackground,
-  visibleShells,
-} from './shells'
+import { clip, commandLine, MAX_SHELLS, patchRunning, readLog, spawnedOf, startShell, visibleShells } from './shells'
 
 const shell = (id: string, extra: Partial<ShellRow> = {}): ShellRow => ({
   id,
   command: `echo ${id}`,
   task: 1,
   status: 'running',
-  isBackground: false,
+  taskId: `b${id}`,
   startedAt: 1000,
   tail: [],
   ...extra,
@@ -35,68 +23,46 @@ describe('shells', () => {
     expect(readLog('a\nb\nc', 2).tail).toEqual(['b', 'c'])
   })
 
-  test("a background log's trailer is its exit code, not a line", () => {
+  test("a log's trailer is its exit code, not a line", () => {
     expect(readLog('built\n\n[exited with code 0]\n')).toEqual({ tail: ['built'], exitCode: 0 })
     expect(readLog('\n[exited with code 2]\n')).toEqual({ tail: [], exitCode: 2 })
   })
 
-  test("a foreground call's output is its stdout and stderr, or the error text", () => {
-    expect(finalOutput({ stdout: 'ok\n', stderr: 'warn' }, 'ok')).toEqual({ output: 'ok\n\nwarn', exitCode: undefined })
-    expect(finalOutput(undefined, 'Exit code 1\nnpm ERR! missing script')).toEqual({
-      output: 'npm ERR! missing script',
-      exitCode: 1,
+  test('a call that left its command in the background spawned a shell, its log the one the result names', () => {
+    const text =
+      'Command running in background with ID: bsrv1. Output is being written to: /private/tmp/claude-501/-p/sid/tasks/bsrv1.output. You will be notified.'
+
+    expect(spawnedOf({ stdout: '', backgroundTaskId: 'bsrv1' }, text)).toEqual({
+      taskId: 'bsrv1',
+      logPath: '/private/tmp/claude-501/-p/sid/tasks/bsrv1.output',
     })
-    expect(endStatus({ result: { interrupted: true } })).toBe('stopped')
-    expect(endStatus({ isError: true })).toBe('failed')
-    expect(endStatus({ result: {} })).toBe('done')
+    expect(spawnedOf({ backgroundTaskId: 'bctrl' }, 'moved to the background')).toEqual({ taskId: 'bctrl' })
+    expect(spawnedOf({ stdout: 'ok', stderr: '' }, 'ok')).toBeUndefined()
+    expect(spawnedOf(undefined, 'Exit code 1')).toBeUndefined()
   })
 
-  test('new logs go to the waiting foreground shells in the order both began', () => {
-    const shells = [shell('s1'), shell('s2', { isBackground: true }), shell('s3', { startedAt: 2000 })]
-    const files = shellFiles([
-      { name: 'bold.output', kind: 'file', mtimeMs: 1 },
-      { name: 'a1.output', kind: 'other', mtimeMs: 2 },
-      { name: 'bnew1.output', kind: 'file', mtimeMs: 5 },
-      { name: 'bnew2.output', kind: 'file', mtimeMs: 6 },
-    ])
-    expect(files).toEqual(['bold', 'bnew1', 'bnew2'])
-
-    const claimed = claimFiles(shells, files, new Set(['bold']))
-    expect(claimed.shells.map(one => one.taskId)).toEqual(['bnew1', undefined, 'bnew2'])
-    expect([...claimed.seen].sort()).toEqual(['bnew1', 'bnew2', 'bold'])
-    expect(shellFiles([{ name: 'bx.output', kind: 'file', mtimeMs: 9 }], 9)).toEqual([])
-  })
-
-  test('a command moved to the background takes its own id back from a guess', () => {
-    const shells = toBackground([shell('s1'), shell('s2', { taskId: 'bq', tail: ['x'] })], 's1', 'bq')
-
-    expect(shells[0]).toMatchObject({ isBackground: true, taskId: 'bq' })
-    expect(shells[1]).toMatchObject({ taskId: undefined, tail: [] })
-  })
-
-  test("each lane shows its latest command: the main one's stays, others while they run or are this task's", () => {
+  test('shells show while running or of the latest task, as the subagents do', () => {
     const shells = [
-      shell('m1', { status: 'done', startedAt: 1 }),
-      shell('m2', { status: 'done', startedAt: 2 }),
-      shell('x1', { agentId: 'a1', status: 'done', startedAt: 3 }),
-      shell('y1', { agentId: 'a2', startedAt: 4, task: 0 }),
-      shell('b1', { isBackground: true, status: 'failed', startedAt: 5, task: 0 }),
+      shell('old', { status: 'done', task: 0, startedAt: 1 }),
+      shell('live', { task: 0, startedAt: 2 }),
+      shell('mine', { status: 'failed', startedAt: 3 }),
     ]
 
-    expect(visibleShells(shells, 1).map(one => one.id)).toEqual(['m2', 'x1', 'y1'])
-    expect(visibleShells(shells, 2).map(one => one.id)).toEqual(['m2', 'y1'])
+    expect(visibleShells(shells, 1).map(one => one.id)).toEqual(['live', 'mine'])
+    expect(visibleShells(shells, 2).map(one => one.id)).toEqual(['live'])
   })
 
-  test('the list keeps its running shells past the cap', () => {
+  test('the list keeps its running shells past the cap; a late read never undoes an end', () => {
     let shells: ShellRow[] = [shell('live', { startedAt: 0 })]
     for (let i = 0; i < MAX_SHELLS + 5; i += 1) shells = startShell(shells, shell(`d${i}`, { status: 'done' }))
 
     expect(shells).toHaveLength(MAX_SHELLS)
     expect(shells[0]?.id).toBe('live')
+    expect(patchRunning([shell('x', { status: 'done' })], 'x', { tail: ['late'] })[0]?.tail).toEqual([])
   })
 
   test('a command shows as its first line, cut to the row', () => {
-    expect(commandLine('cd app &&\n  npm test')).toBe('cd app && …')
+    expect(commandLine('cd app &&\n  npm run dev')).toBe('cd app && …')
     expect(clip('npm run build', 8)).toBe('npm run…')
     expect(clip('ls', 8)).toBe('ls')
   })
