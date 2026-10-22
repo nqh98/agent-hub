@@ -5,11 +5,15 @@ import {
   claimFiles,
   clip,
   commandLine,
+  commandLines,
   endStatus,
   finalOutput,
+  isStoppable,
+  KEEP_LINES,
   MAX_SHELLS,
   readLog,
   shellFiles,
+  shellHistory,
   startShell,
   toBackground,
   visibleShells,
@@ -99,5 +103,31 @@ describe('shells', () => {
     expect(commandLine('cd app &&\n  npm test')).toBe('cd app && …')
     expect(clip('npm run build', 8)).toBe('npm run…')
     expect(clip('ls', 8)).toBe('ls')
+  })
+
+  test('a log keeps its latest KEEP_LINES lines for the detail', () => {
+    const text = Array.from({ length: KEEP_LINES + 10 }, (_, i) => `line ${i + 1}`).join('\n')
+    const { tail } = readLog(text)
+
+    expect(tail).toHaveLength(KEEP_LINES)
+    expect(tail[0]).toBe('line 11')
+    expect(tail.at(-1)).toBe(`line ${KEEP_LINES + 10}`)
+  })
+
+  test('the detail shows every line of a command, secrets masked', () => {
+    expect(commandLines('cd app &&\n\n  deploy --token=abc123 now   \n')).toEqual(['cd app &&', '  deploy --token=*** now'])
+  })
+
+  test('only a background command still running, with its id, can be stopped', () => {
+    expect(isStoppable(shell('a', { isBackground: true, taskId: 'b1' }))).toBe(true)
+    expect(isStoppable(shell('b', { isBackground: true }))).toBe(false)
+    expect(isStoppable(shell('c', { taskId: 'b2' }))).toBe(false)
+    expect(isStoppable(shell('d', { isBackground: true, taskId: 'b3', status: 'done' }))).toBe(false)
+  })
+
+  test('every shell is listed newest first', () => {
+    const order = shellHistory([shell('old', { startedAt: 1 }), shell('new', { startedAt: 3 }), shell('mid', { startedAt: 2 })])
+
+    expect(order.map(one => one.id)).toEqual(['new', 'mid', 'old'])
   })
 })
