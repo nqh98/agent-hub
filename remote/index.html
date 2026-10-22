@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%221 0 16 10%22 shape-rendering=%22crispEdges%22 fill=%22%23d97757%22><rect x=%223%22 y=%220%22 width=%2212%22 height=%222%22/><rect x=%223%22 y=%222%22 width=%222%22 height=%222%22/><rect x=%226%22 y=%222%22 width=%226%22 height=%222%22/><rect x=%2213%22 y=%222%22 width=%222%22 height=%222%22/><rect x=%221%22 y=%224%22 width=%2216%22 height=%222%22/><rect x=%223%22 y=%226%22 width=%2212%22 height=%222%22/><rect x=%224%22 y=%228%22 width=%221%22 height=%222%22/><rect x=%226%22 y=%228%22 width=%221%22 height=%222%22/><rect x=%2211%22 y=%228%22 width=%221%22 height=%222%22/><rect x=%2213%22 y=%228%22 width=%221%22 height=%222%22/></svg>">
+<title>Agent Hub</title>
+<!-- The answer's Markdown, rendered then sanitised; without them it shows as plain text. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js" integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi" crossorigin="anonymous" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js" integrity="sha384-+VfUPEb0PdtChMwmBcBmykRMDd+v6D/oFmB3rZM/puCMDYcIvF968OimRh4KQY9a" crossorigin="anonymous" defer></script>
+<style>
+  :root {
+    --bg: #1a1a19; --panel: #232322; --line: #3a3a38; --text: #e8e6e1; --dim: #8f8c85;
+    --accent: #d97757; --ok: #7bb26a; --warn: #e0b04f; --err: #e06c5b; --run: #6aa6e0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    padding: 12px 16px calc(16px + env(safe-area-inset-bottom));
+  }
+  /* The title and the pane's groups stay at the top while the conversation scrolls under them. */
+  #top {
+    position: sticky; top: 0; z-index: 2; margin: -12px -16px 0; padding: 12px 16px 8px;
+    background: var(--bg); border-bottom: 1px solid var(--line);
+  }
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  /* One line that sums the groups up, under a rule as the pane draws between
+     its groups; a tap opens or folds them, the arrow at its right end. */
+  #summary {
+    display: flex; align-items: center; gap: 12px; width: 100%; height: auto; padding: 6px 0 0;
+    background: none; color: var(--dim); border-top: 1px solid var(--line); border-radius: 0;
+    font-size: 12px; font-weight: normal; text-align: left;
+  }
+  #summary .chips { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+  #summary .chev { flex: none; color: var(--text); font-size: 14px; width: 1ch; text-align: center; }
+  #summary .chip { white-space: nowrap; display: inline-flex; align-items: center; gap: 6px; }
+  #summary .chip b { color: var(--text); font-weight: normal; }
+  #summary .chip.on, #summary .chip.on b { color: var(--accent); }
+  #summary .chip.hot, #summary .chip.hot b { color: var(--err); }
+  #summary .mini { width: 36px; height: 6px; background: var(--line); border-radius: 2px; overflow: hidden; }
+  #summary .mini i { display: block; height: 100%; background: var(--accent); }
+  #summary .chip.hot .mini i { background: var(--err); }
+  /* Open, the groups scroll on their own under the line, at most half the screen. */
+  #groups { max-height: 50vh; overflow: auto; overscroll-behavior: contain; margin-top: 6px; }
+  /* Open, a rule under the line too, as between the pane's groups. */
+  #groups[hidden] { display: none; }
+  header h1 { display: flex; align-items: center; gap: 8px; font-size: 16px; margin: 0; color: var(--accent); }
+  /* Claude Code's mascot as the pane draws it in blocks, each block twice as tall as wide. */
+  header h1 .mascot { width: 26px; height: 16px; flex: none; fill: currentColor; }
+  #status { color: var(--dim); font-size: 12px; }
+  #status.busy { color: var(--run); }
+  #status.off { color: var(--err); }
+  section { border-top: 1px solid var(--line); padding: 8px 0; }
+  section:empty { display: none; }
+  h2 { font-size: 14px; margin: 0 0 4px; }
+  h2 b { color: var(--accent); }
+  h2 span { color: var(--dim); font-weight: normal; }
+  .bar { height: 8px; background: var(--line); border-radius: 2px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .bar i.hot { background: var(--err); }
+  .row { white-space: pre-wrap; word-break: break-word; }
+  .dim { color: var(--dim); }
+  .done { color: var(--dim); text-decoration: line-through; }
+  .working { color: var(--accent); }
+  .card { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; margin: 6px 0; background: var(--panel); }
+  .card.ended { opacity: .6; }
+  .card .top { display: flex; justify-content: space-between; gap: 8px; }
+  .running, .waiting { color: var(--run); } .completed, .idle { color: var(--ok); }
+  .failed, .killed, .stopped { color: var(--err); }
+  pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; font: inherit; }
+  .tail { color: var(--dim); font-size: 12px; }
+  /* The prompt box stays at the screen's foot, as in a chat; the pane scrolls above it. */
+  footer {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 1;
+    background: var(--bg); border-top: 1px solid var(--line);
+    padding: 8px 16px calc(8px + env(safe-area-inset-bottom));
+  }
+  /* Send sits inside the box, at its bottom right corner. */
+  form { position: relative; }
+  textarea {
+    display: block; width: 100%; height: 44px; max-height: 140px; resize: none; padding: 10px 48px 10px 10px; border-radius: 6px;
+    background: var(--panel); color: var(--text); border: 1px solid var(--line); font: inherit; font-size: 16px; line-height: 1.4;
+  }
+  textarea:focus { outline: 1px solid var(--accent); }
+  /* The hint keeps to one line, cut short on a narrow screen rather than wrapped. */
+  textarea::placeholder { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  button { font: inherit; border: 0; }
+  #send {
+    position: absolute; right: 6px; bottom: 6px; width: 32px; height: 32px; padding: 0; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center; background: var(--accent); color: #1a1a19;
+  }
+  #send svg { width: 18px; height: 18px; }
+  button:disabled { opacity: .5; }
+  #note { color: var(--dim); font-size: 12px; }
+  /* The conversation, as Claude Code's transcript draws it: each prompt on a
+     shaded row, the answer under its ⏺, the turn running under the spinner.
+     It runs in the page, as tall as it needs; the page scrolls. */
+  #chat .turn + .turn { margin-top: 14px; }
+  #chat .prompt {
+    padding: 6px 8px; background: var(--panel); border-radius: 4px; white-space: pre-wrap; word-break: break-word;
+  }
+  #chat .prompt.clamp { display: -webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical; overflow: hidden; }
+  #chat .line { display: flex; gap: 8px; margin-top: 6px; padding: 0 8px; }
+  #chat .mark { width: 1ch; flex: none; color: var(--ok); }
+  #chat .body { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; }
+  #chat .body.md { white-space: normal; }
+  #chat .body.none, #chat .is-waiting .mark, #chat .is-waiting .body { color: var(--dim); }
+  /* Claude Code's own spinner: a glyph that grows and shrinks, in its orange. */
+  #chat .spin .mark, #chat .spin .verb { color: var(--accent); }
+  #chat .spin .body { color: var(--dim); }
+  #chat .is-failed .mark, #chat .is-failed .body { color: var(--err); }
+  /* The answer as Markdown, as Claude Code formats it in the terminal. */
+  .md > :first-child { margin-top: 0; }
+  .md > :last-child { margin-bottom: 0; }
+  .md p, .md ul, .md ol, .md pre, .md table, .md blockquote { margin: 0 0 8px; }
+  .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { font-size: 14px; margin: 10px 0 6px; color: var(--accent); }
+  .md ul, .md ol { padding-left: 20px; }
+  .md li + li { margin-top: 2px; }
+  .md code { background: var(--line); padding: 0 4px; border-radius: 3px; }
+  .md pre { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; }
+  .md pre code { background: none; padding: 0; }
+  .md table { border-collapse: collapse; display: block; max-width: 100%; overflow-x: auto; }
+  .md th, .md td { border: 1px solid var(--line); padding: 2px 6px; text-align: left; vertical-align: top; }
+  .md th { color: var(--accent); }
+  .md a { color: var(--run); }
+  .md blockquote { border-left: 3px solid var(--line); padding-left: 8px; color: var(--dim); }
+  .md hr { border: 0; border-top: 1px solid var(--line); margin: 8px 0; }
+  /* The typeahead over the box: / lists commands, @ the project's files. */
+  #suggest {
+    max-height: 40vh; overflow: auto; margin-bottom: 8px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  }
+  #suggest[hidden] { display: none; }
+  #suggest .pick {
+    display: flex; gap: 8px; width: 100%; height: auto; padding: 8px 10px; border-radius: 0;
+    background: none; color: var(--text); font-weight: normal; text-align: left; white-space: nowrap; overflow: hidden;
+  }
+  #suggest .pick + .pick { border-top: 1px solid var(--line); }
+  #suggest .pick:active { background: var(--line); }
+  #suggest .name { color: var(--accent); flex: none; }
+  #suggest .hint { color: var(--dim); overflow: hidden; text-overflow: ellipsis; }
+  #note:empty, #usage:empty { display: none; }
+  #note { margin-bottom: 6px; }
+  #usage { margin-top: 6px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="top">
+  <header><h1><svg class="mascot" viewBox="1 0 16 10" shape-rendering="crispEdges" aria-hidden="true"><rect x="3" y="0" width="12" height="2"/><rect x="3" y="2" width="2" height="2"/><rect x="6" y="2" width="6" height="2"/><rect x="13" y="2" width="2" height="2"/><rect x="1" y="4" width="16" height="2"/><rect x="3" y="6" width="12" height="2"/><rect x="4" y="8" width="1" height="2"/><rect x="6" y="8" width="1" height="2"/><rect x="11" y="8" width="1" height="2"/><rect x="13" y="8" width="1" height="2"/></svg>Agent Hub</h1><span id="status">connecting…</span></header>
+  <button id="summary" type="button" aria-expanded="false" aria-controls="groups"><span class="chips">waiting for the session…</span><span class="chev">▸</span></button>
+  <div id="groups" hidden>
+    <section id="context"></section>
+    <section id="tasks"></section>
+    <section id="agents"></section>
+    <section id="shells"></section>
+  </div>
+</div>
+<section id="chat"></section>
+<footer id="foot">
+  <div id="note"></div>
+  <div id="suggest" hidden></div>
+  <form id="prompt">
+    <textarea id="text" rows="1" placeholder="Prompt, /command, @file" autocomplete="off" autocapitalize="off"></textarea>
+    <button id="send" type="submit" aria-label="Send" title="Send (⌘↵)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>
+    </button>
+  </form>
+  <div id="usage"></div>
+</footer>
+<script>
+  const token = new URLSearchParams(location.search).get('t') || ''
+  const api = path => `${path}?t=${encodeURIComponent(token)}`
+  const $ = id => document.getElementById(id)
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag)
+    if (cls) node.className = cls
+    if (text !== undefined) node.textContent = text
+    return node
+  }
+  function heading(name, tally) {
+    const h = el('h2')
+    h.append(el('b', '', name), document.createTextNode(': '))
+    if (tally) h.append(el('span', '', tally))
+    return h
+  }
+  function fill(id, nodes) { $(id).replaceChildren(...nodes) }
+
+  const TASK_GLYPH = { completed: '✔', in_progress: '■', pending: '□' }
+  const AGENT_GLYPH = { running: '●', waiting: '◐', idle: '○', completed: '✔', failed: '✖', killed: '■', pending: '○' }
+  const ENDED = new Set(['completed', 'failed', 'killed'])
+
+  function draw(view) {
+    const ctx = view.context
+    if (ctx) {
+      const bar = el('div', 'bar'); const i = el('i', ctx.percent >= 80 ? 'hot' : ''); i.style.width = `${Math.min(100, ctx.percent)}%`; bar.append(i)
+      fill('context', [heading('Context', `${ctx.percent}% · ${ctx.used} / ${ctx.window} tok`), bar])
+    } else fill('context', [])
+
+    if (view.tasks.length) {
+      const counts = ['in_progress', 'pending', 'completed'].map(s => [s, view.tasks.filter(t => t.status === s).length]).filter(([, n]) => n)
+      const words = { in_progress: 'in progress', pending: 'pending', completed: 'done' }
+      const nodes = [heading('Tasks', counts.map(([s, n]) => `${n} ${words[s]}`).join(' · '))]
+      if (view.working) nodes.push(el('div', 'row working', `✳ ${view.working}…`))
+      for (const t of view.tasks) nodes.push(el('div', `row ${t.status === 'completed' ? 'done' : ''}`, `  ${TASK_GLYPH[t.status]} ${t.text}`))
+      fill('tasks', nodes)
+    } else fill('tasks', [])
+
+    if (view.agents.length) {
+      const running = view.agents.filter(a => !ENDED.has(a.status)).length
+      const nodes = [heading('Subagents', `${running} running · ${view.agents.length - running} done`)]
+      for (const a of view.agents) {
+        const card = el('div', `card ${ENDED.has(a.status) ? 'ended' : ''}`); card.style.marginLeft = `${a.depth * 12}px`
+        const top = el('div', 'top')
+        const left = el('span'); left.append(el('span', a.status, AGENT_GLYPH[a.status] || '●'), document.createTextNode(` ${a.type}`))
+        top.append(left, el('span', 'dim', [a.elapsed, a.tokens && `${a.tokens} tok`].filter(Boolean).join(' · ')))
+        card.append(top, el('div', 'row dim', a.description))
+        if (a.step && !ENDED.has(a.status)) card.append(el('div', 'row', `  ${a.step}`))
+        nodes.push(card)
+      }
+      fill('agents', nodes)
+    } else fill('agents', [])
+
+    if (view.shells.length) {
+      const running = view.shells.filter(s => s.status === 'running').length
+      const nodes = [heading('Shells', `${running} running · ${view.shells.length - running} done`)]
+      for (const s of view.shells) {
+        const card = el('div', `card ${s.status === 'running' ? '' : 'ended'}`)
+        card.append(el('div', `row ${s.status}`, `$ ${s.command}`))
+        if (s.tail.length) card.append(el('pre', 'tail', s.tail.join('\n')))
+        nodes.push(card)
+      }
+      fill('shells', nodes)
+    } else fill('shells', [])
+
+    const parts = view.limits.map(l => `${l.name} ${l.used}${l.reset ? ` · ↻ ${l.reset}` : ''}`)
+    if (view.cost) parts.push(view.cost)
+    fill('usage', parts.length ? [el('div', 'row dim', parts.join('   '))] : [])
+    drawSummary(view)
+  }
+
+  // The groups summed up on one line, a chip each, lit while something in it runs.
+  function drawSummary(view) {
+    const chip = (name, value, state) => {
+      const node = el('span', `chip ${state || ''}`)
+      node.append(document.createTextNode(name), el('b', '', value))
+      return node
+    }
+    const chips = []
+    const ctx = view.context
+    if (ctx) {
+      const node = chip('Context', `${ctx.percent}%`, ctx.percent >= 80 ? 'hot' : '')
+      const mini = el('span', 'mini'); const i = el('i'); i.style.width = `${Math.min(100, ctx.percent)}%`; mini.append(i)
+      node.append(mini)
+      chips.push(node)
+    }
+    if (view.tasks.length) {
+      const done = view.tasks.filter(t => t.status === 'completed').length
+      chips.push(chip('Tasks', `${done}/${view.tasks.length}`, view.tasks.some(t => t.status === 'in_progress') ? 'on' : ''))
+    }
+    if (view.agents.length) {
+      const running = view.agents.filter(a => !ENDED.has(a.status)).length
+      chips.push(chip('Agents', running ? `${running} running` : `${view.agents.length} done`, running ? 'on' : ''))
+    }
+    if (view.shells.length) {
+      const running = view.shells.filter(s => s.status === 'running').length
+      chips.push(chip('Shells', running ? `${running} running` : `${view.shells.length} done`, running ? 'on' : ''))
+    }
+    const isOpen = !$('groups').hidden
+    const row = el('span', 'chips')
+    row.append(...(chips.length ? chips : [document.createTextNode('nothing to show yet')]))
+    $('summary').replaceChildren(row, el('span', 'chev', isOpen ? '▾' : '▸'))
+  }
+
+  // Open or folded as this phone last left it; folded at first, the room the conversation's.
+  const GROUPS_KEY = 'agent-hub-groups'
+  function setGroups(isOpen) {
+    $('groups').hidden = !isOpen
+    $('summary').setAttribute('aria-expanded', String(isOpen))
+    const chev = $('summary').querySelector('.chev')
+    if (chev) chev.textContent = isOpen ? '▾' : '▸'
+    try { localStorage.setItem(GROUPS_KEY, isOpen ? 'open' : 'closed') } catch {}
+  }
+  $('summary').addEventListener('click', () => setGroups($('groups').hidden))
+  try { setGroups(localStorage.getItem(GROUPS_KEY) === 'open') } catch { setGroups(false) }
+
+  // The prompt this phone sent last, shown at the foot of the conversation
+  // until the session's history holds it, and kept over a reload. `at` is the
+  // machine's clock (the helper's `now`).
+  const SENT_KEY = 'agent-hub-sent'
+  let sent = null
+  try { sent = JSON.parse(sessionStorage.getItem(SENT_KEY) || 'null') } catch {}
+  const keepSent = () => { try { sessionStorage.setItem(SENT_KEY, JSON.stringify(sent)) } catch {} }
+  // The latest poll: the view, the prompts the helper holds, the machine's clock then, and this phone's.
+  let last = { view: null, inbox: 0, now: 0, seenAt: 0 }
+  // The session's latest turns, as the mod read them from its transcript.
+  let history = { turns: [], at: 0 }
+
+  const clock = ms => {
+    const s = Math.max(0, Math.floor(ms / 1000))
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+  }
+
+  async function loadHistory(at) {
+    if (!at || at === history.at) return
+    try {
+      const res = await fetch(api('/api/history'), { cache: 'no-store' })
+      if (res.ok) history = await res.json()
+    } catch {}
+  }
+
+  const REASON = { aborted: 'Interrupted', refusal: 'Refused', error: 'The turn ended on an error' }
+  // What follows the history: the turn running (whoever typed it), this
+  // phone's prompt waiting for the session, or an answer the history does not
+  // hold (a command run from the phone). A running turn the history already
+  // holds keeps its row there, the spinner under what it wrote so far.
+  function tailOf(view) {
+    const lastTurn = history.turns.at(-1)
+    if (view && view.busy && view.current) {
+      const mine = sent && view.current.prompt === sent.text
+      return {
+        kind: 'live', text: view.current.prompt, since: view.current.startedAt,
+        who: mine ? '' : ' (typed at the terminal)', inHistory: lastTurn && lastTurn.prompt === view.current.prompt,
+      }
+    }
+    if (!sent) return null
+    if (last.inbox > 0 || (view && view.queued.includes(sent.text))) return { kind: 'waiting', text: sent.text }
+    if (history.turns.some(turn => turn.prompt === sent.text)) {
+      // The history shows it from now on.
+      sent = null
+      keepSent()
+      return null
+    }
+    const result = view && view.result
+    if (!result || result.prompt !== sent.text || result.at < sent.at) return { kind: 'waiting', text: sent.text }
+    return result.reason === 'answer'
+      ? { kind: 'done', text: sent.text, answer: result.text }
+      : { kind: 'failed', text: sent.text, answer: result.text || REASON[result.reason] || result.reason }
+  }
+
+  // Claude Code's spinner: its glyphs out and back, and a verb kept for the turn.
+  const FRAMES = ['·', '✢', '✳', '✶', '✻', '✽', '✻', '✶', '✳', '✢']
+  const VERBS = ['Working', 'Thinking', 'Pondering', 'Crafting', 'Cooking', 'Brewing', 'Noodling', 'Puttering', 'Tinkering', 'Wrangling']
+  const verbOf = since => VERBS[Math.abs(Math.floor(since / 1000)) % VERBS.length]
+  // The running turn's spinner glyph and its words, moved between redraws.
+  let spinner = null
+  let frame = 0
+  setInterval(() => {
+    frame = (frame + 1) % FRAMES.length
+    if (spinner) spinner.mark.textContent = FRAMES[frame]
+  }, 120)
+  function tickSpinner() {
+    if (!spinner) return
+    const now = last.now + (Date.now() - last.seenAt)
+    spinner.body.replaceChildren(el('span', 'verb', `${verbOf(spinner.since)}…`), document.createTextNode(` (${clock(now - spinner.since)}${spinner.who})`))
+  }
+
+  // An answer as Markdown, sanitised, its links opening apart; plain text when
+  // the renderer did not load.
+  function markdown(node, text) {
+    if (!(window.marked && window.DOMPurify)) {
+      node.textContent = text
+      return
+    }
+    node.classList.add('md')
+    // No images or forms: an answer must not make the phone load an address.
+    node.innerHTML = DOMPurify.sanitize(marked.parse(text, { gfm: true }), { FORBID_TAGS: ['img', 'style', 'form', 'input', 'button'] })
+    for (const link of node.querySelectorAll('a')) {
+      link.target = '_blank'
+      link.rel = 'noopener noreferrer'
+    }
+  }
+
+  // One turn: the prompt (a long one folded to six lines, a tap unfolds it), then its answer line.
+  function turnNode(text, kind, fillBody) {
+    const turn = el('div', `turn is-${kind}`)
+    const prompt = el('div', 'prompt', `› ${text}`)
+    if (text.split('\n').length > 6 || text.length > 480) {
+      prompt.classList.add('clamp')
+      prompt.addEventListener('click', () => prompt.classList.toggle('clamp'))
+    }
+    turn.append(prompt)
+    if (fillBody) {
+      const line = el('div', 'line')
+      const mark = el('span', 'mark', '⏺')
+      const body = el('div', 'body')
+      line.append(mark, body)
+      fillBody(body, mark)
+      turn.append(line)
+    }
+    return turn
+  }
+  const answerLine = text => (body, mark) => {
+    if (text) markdown(body, text)
+    else { body.classList.add('none'); body.textContent = '(no text)' }
+  }
+  const liveLine = tail => (body, mark) => {
+    mark.parentElement?.classList.add('spin')
+    spinner = { mark, body, since: tail.since, who: tail.who }
+    mark.textContent = FRAMES[frame]
+    tickSpinner()
+  }
+
+  // Redrawn only when what it shows changes, so a scroll through it stays put;
+  // kept at the foot while the reader is there.
+  let chatKey = ''
+  function drawChat() {
+    const tail = tailOf(last.view)
+    // The renderer loading late redraws the answers it can now format.
+    const key = JSON.stringify([history.at, tail && { ...tail, since: undefined }, tail && tail.since, Boolean(window.marked && window.DOMPurify)])
+    if (key === chatKey) return tickSpinner()
+    const isFirst = chatKey === ''
+    chatKey = key
+    const atFoot = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 120
+    spinner = null
+    const turns = tail && tail.kind === 'live' && tail.inHistory ? history.turns.slice(0, -1) : history.turns
+    const nodes = turns.map(turn => turnNode(turn.prompt, 'done', answerLine(turn.answer)))
+    if (tail) {
+      if (tail.kind === 'live') {
+        const held = tail.inHistory ? history.turns.at(-1).answer : ''
+        const node = turnNode(tail.text, 'live', held ? answerLine(held) : liveLine(tail))
+        if (held) {
+          const line = el('div', 'line spin')
+          const mark = el('span', 'mark')
+          const body = el('div', 'body')
+          line.append(mark, body)
+          node.append(line)
+          liveLine(tail)(body, mark)
+        }
+        nodes.push(node)
+      } else if (tail.kind === 'waiting') {
+        nodes.push(turnNode(tail.text, 'waiting', (body, mark) => { mark.textContent = '·'; body.textContent = 'Waiting for the session…' }))
+      } else if (tail.kind === 'done') {
+        nodes.push(turnNode(tail.text, 'done', answerLine(tail.answer)))
+      } else {
+        nodes.push(turnNode(tail.text, 'failed', (body) => { body.textContent = tail.answer }))
+      }
+    }
+    fill('chat', nodes.length ? [heading('Conversation', `${history.turns.length} ${history.turns.length === 1 ? 'turn' : 'turns'}`), ...nodes] : [])
+    // After the footer's room under the page is set, the next frame.
+    if (isFirst || atFoot) requestAnimationFrame(() => window.scrollTo(0, document.documentElement.scrollHeight))
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch(api('/api/state'), { cache: 'no-store' })
+      if (!res.ok) throw new Error(res.status)
+      const { view, at, now, inbox, historyAt } = await res.json()
+      last = { view, inbox, now, seenAt: Date.now() }
+      await loadHistory(historyAt)
+      const status = $('status')
+      if (!view || now - at > 5000) { status.textContent = 'session not syncing'; status.className = 'off' }
+      else if (view.busy) { status.textContent = 'working…'; status.className = 'busy' }
+      else { status.textContent = 'idle'; status.className = '' }
+      if (view) draw(view)
+      drawChat()
+      const waiting = inbox + (view ? view.queued.length : 0)
+      $('note').textContent = waiting > 1 ? `${waiting} prompts waiting for the session` : ''
+    } catch (error) {
+      $('status').textContent = 'offline'; $('status').className = 'off'
+    }
+  }
+
+  $('prompt').addEventListener('submit', async event => {
+    event.preventDefault()
+    const text = $('text').value.trim()
+    if (!text) return
+    $('send').disabled = true
+    try {
+      const res = await fetch(api('/api/prompt'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ text }) })
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.status)
+      $('text').value = ''
+      grow()
+      suggest()
+      // Shown at once, before the session picks it up.
+      sent = { text, at: last.now + (Date.now() - last.seenAt) }
+      keepSent()
+      $('note').textContent = ''
+      drawChat()
+      window.scrollTo(0, document.documentElement.scrollHeight)
+      poll()
+    } catch (error) {
+      $('note').textContent = `not sent: ${error.message}`
+    } finally {
+      $('send').disabled = false
+    }
+  })
+  $('text').addEventListener('keydown', event => {
+    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) $('prompt').requestSubmit()
+  })
+  // The box grows with what is typed, up to its max-height, then scrolls.
+  function grow() {
+    const box = $('text')
+    box.style.height = 'auto'
+    box.style.height = `${Math.max(44, box.scrollHeight + 2)}px`
+  }
+  $('text').addEventListener('input', grow)
+
+  // The typeahead: the commands and files the mod sent, filtered here as one types.
+  let catalog = { commands: [], files: [] }
+  async function loadCatalog() {
+    try {
+      const res = await fetch(api('/api/catalog'), { cache: 'no-store' })
+      if (res.ok) catalog = await res.json()
+    } catch {}
+  }
+  // What is being typed at the caret: a /command opening the prompt, or an @path.
+  function tokenAt(box) {
+    const before = box.value.slice(0, box.selectionStart)
+    const slash = /^\s*\/([\w:.-]*)$/.exec(before)
+    if (slash) return { kind: 'command', query: slash[1], start: before.length - slash[1].length - 1 }
+    const at = /(?:^|\s)@([^\s@]*)$/.exec(before)
+    if (at) return { kind: 'file', query: at[1], start: before.length - at[1].length - 1 }
+    return null
+  }
+  // At most eight: names that start with what was typed first, then those that hold it.
+  function matches(token) {
+    const q = token.query.toLowerCase()
+    if (token.kind === 'command') {
+      return catalog.commands
+        .filter(c => c.name.toLowerCase().includes(q))
+        .sort((a, b) => Number(b.name.toLowerCase().startsWith(q)) - Number(a.name.toLowerCase().startsWith(q)))
+        .slice(0, 8)
+        .map(c => ({ insert: `/${c.name} `, label: `/${c.name}`, hint: c.description }))
+    }
+    const rank = f => {
+      const base = f.split('/').pop().toLowerCase()
+      return base.startsWith(q) ? 0 : base.includes(q) ? 1 : 2
+    }
+    return catalog.files
+      .filter(f => f.toLowerCase().includes(q))
+      .sort((a, b) => rank(a) - rank(b) || a.length - b.length)
+      .slice(0, 8)
+      .map(f => ({ insert: `@${f} `, label: f, hint: '' }))
+  }
+  function suggest() {
+    const box = $('text')
+    const token = tokenAt(box)
+    const found = token ? matches(token) : []
+    const list = $('suggest')
+    list.hidden = found.length === 0
+    list.replaceChildren(...found.map(item => {
+      const pick = el('button', 'pick')
+      pick.type = 'button'
+      pick.append(el('span', 'name', item.label))
+      if (item.hint) pick.append(el('span', 'hint', item.hint))
+      // The box keeps the keyboard up while a pick is pressed.
+      pick.addEventListener('mousedown', event => event.preventDefault())
+      pick.addEventListener('click', () => {
+        const end = box.selectionStart
+        box.value = box.value.slice(0, token.start) + item.insert + box.value.slice(end)
+        const caret = token.start + item.insert.length
+        box.setSelectionRange(caret, caret)
+        box.focus()
+        grow()
+        suggest()
+      })
+      return pick
+    }))
+  }
+  for (const event of ['input', 'click', 'keyup']) $('text').addEventListener(event, suggest)
+  loadCatalog()
+  setInterval(loadCatalog, 30_000)
+  // The page keeps room under the pane for the footer, however tall it grows.
+  new ResizeObserver(() => { document.body.style.paddingBottom = `${$('foot').offsetHeight + 12}px` }).observe($('foot'))
+
+  poll()
+  setInterval(poll, 1500)
+  // The elapsed time moves each second between polls.
+  setInterval(tickSpinner, 1000)
+</script>
+</body>
+</html>

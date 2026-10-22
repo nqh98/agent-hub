@@ -96,6 +96,19 @@ A card warns when a subagent may be stuck: no step for two minutes, the same cal
 
 Subagents have no checklist tool of their own, so Agent Hub registers one, `mcp__agent-hub__checklist`. A subagent that calls it shows its checklist inside its card, with its calls under the item in progress. Ask for it in the prompt you give the subagent, for example: *"Keep a checklist with the checklist tool."*
 
+### Remote control from a phone
+
+Works when you sign in with an API key, where Claude Code's own Remote Control is not available. `/agent-hub-remote` (or ask Claude to use the `mcp__agent-hub__remote` tool) starts a small local server and a [localhost.run](https://localhost.run) tunnel over `ssh`, then shows a link and its QR code in the pane's **Remote** group. Scan the code with the phone's camera, or open the link, and the page shows the pane's groups at once, with no reminder or password page in front: a box whose prompts go to the session as if typed at the terminal, and the conversation to review. Run `/agent-hub-remote` again, or press **stop remote**, to close it.
+
+- Needs `node` and `ssh` on the PATH (macOS has `ssh`); no account, nothing to install.
+- The QR code is drawn with half blocks, light on dark whatever the theme; **hide QR** folds it away, and a pane too narrow for it says so instead. A terminal with extra line spacing breaks the code up: open the link instead.
+- The tunnel's address is new at each start, and localhost.run's free tier may change it while it runs: the pane then shows the new link.
+- The link carries a secret token, kept across sessions. Anyone with the link can prompt the session, so keep it to yourself.
+- Type `/` for the session's commands and `@` for the project's files (as git lists them); a pick fills the box. A command runs as if typed at the terminal and its output is the answer; one that draws a picker there (`/model`, `/resume`, `/config`…) says so instead. The files a prompt mentions with `@` go to the model beside it, as Claude Code does for a typed prompt (text files inside the project, 100 kB each).
+- The title stays at the top with one line that sums the pane's groups up (context, tasks, agents, shells; lit while something runs). Tap it to open the groups under it, scrolling on their own in at most half the screen, and again to fold them; the phone keeps your choice.
+- Under them runs the conversation: the session's latest 30 turns, each prompt (typed at the terminal or on the phone) with the assistant's text under it, tool calls left out. The turn running shows Claude Code's spinner under what it has written so far; a prompt you sent waits at the foot until the session takes it. Answers are formatted as Markdown (headings, lists, code, tables, links; no images) and take the room they need, the page scrolling; it stays at the foot while you are there. The renderer loads from cdnjs; without it answers show as plain text.
+- Permission prompts are answered at the terminal, not on the phone: run in a mode that needs none if you will be away.
+
 ## FAQ
 
 **`/agent-hub` says "Unknown command" after installing.** Run `/reload-plugins --force` (without `--force` the reload is only offered), or start a new session. A plugin installed at local scope is enabled only in the project you installed it from.

@@ -142,6 +142,16 @@ export type ShellRow = {
   /** The log's size when last read; it is read again only when that changes. */
   size?: number
 }
+/** Remote control as the pane shows it: the helper starting, its tunnel up, or why it failed. */
+export type RemoteStatus = {
+  status: 'off' | 'starting' | 'on' | 'error'
+  /** The tunnel's address with the token: what the phone opens. */
+  link?: string
+  /** The helper's latest error line. */
+  note?: string
+  /** The link's QR code folded away in the pane. */
+  isQrHidden?: boolean
+}
 declare module 'claude-code' {
   interface PluginState {
     'agent-hub': {
@@ -176,6 +186,8 @@ declare module 'claude-code' {
       showAll: boolean
       /** Running agents' cards list their latest steps; off, only what runs now. Finished cards stay folded. */
       isExpanded: boolean
+      /** Remote control; off again after a reload, which ends the helper. */
+      remote: RemoteStatus
     }
   }
 }
