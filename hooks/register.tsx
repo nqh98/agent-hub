@@ -48,6 +48,7 @@ import {
   formatElapsed,
   hasActive,
   isEnded,
+  isPersonOrigin,
   latestTask,
   visibleTree,
 } from './roster'
@@ -764,9 +765,11 @@ export const register: Register = on => {
   })
 
   // Each prompt the person sends starts a task; a slash command or a prompt
-  // the engine made itself does not, so opening the pane hides nothing.
+  // the engine made itself (a background task's notification, a subagent's
+  // hand-back) does not, so neither opening the pane nor an agent finishing
+  // hides what the person's prompt started.
   on('prompt.submit', async ($, e, next) => {
-    if (e.command === undefined && e.isMeta !== true) {
+    if (e.command === undefined && e.isMeta !== true && isPersonOrigin(e.origin)) {
       await update($, task, n => n + 1).catch(() => undefined)
     }
     // A phone prompt's @ files, read before it was submitted.
