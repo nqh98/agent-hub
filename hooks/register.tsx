@@ -13,6 +13,8 @@ import type {
   TodoStatus,
   TurnEndReason,
 } from '../types'
+import { alertModeOf, contextAlert, stuckAlerts } from './alerts'
+import type { AlertMode } from './alerts'
 import { innerWidth, MIN_CARD_WIDTH, plural, spinnerFrame, stripRoom } from './card'
 import { framed, row as layoutRow } from './layout'
 import type { Line, Seg } from './layout'
@@ -138,6 +140,7 @@ const BAR_FULL_COLOR = 'error'
 const sessionCost = atom({ plugin: 'agent-hub', key: 'sessionCostUsd' } as const, null)
 const rateLimits = atom({ plugin: 'agent-hub', key: 'rateLimits' } as const, [])
 const shells = atom({ plugin: 'agent-hub', key: 'shells' } as const, [])
+const alerted = atom({ plugin: 'agent-hub', key: 'alerted' } as const, [])
 // The steps a running agent's expanded card lists, and the calls under its
 // item in progress: few, so a card stays short; a finished agent's card
 // folds to one line, and the detail view lists them all.
@@ -220,6 +223,9 @@ const openKey = (id: string) => `open:${id}`
 const childKey = (id: string) => `child:${id}`
 
 let ticks = 0
+// How the person asked to hear of a stuck agent or a full context: the
+// `alerts` option, read as the module registers.
+let alertMode: AlertMode = 'toast'
 // Where the engine writes the session's command logs, once found, and the
 // log files already given out or passed over. The module's own: a reload
 // looks again.
@@ -364,9 +370,31 @@ async function refresh($: EngineInterface) {
   }
 }
 
+// Says `text` the way the person asked: a toast, and a notification of their
+// own channel beside it under `notify`.
+function alert($: EngineInterface, text: string) {
+  if (alertMode === 'off') return
+  $.ui.toast(`Agent Hub: ${text}`, { timeoutMs: 8000 })
+  if (alertMode === 'notify') void $.ui.notify(text, { title: TITLE }).catch(() => undefined)
+}
+
+// Says once of each running agent that may have got stuck; one that recovers
+// may be said of again.
+async function checkStuck($: EngineInterface) {
+  if (alertMode === 'off') return
+  const t = await $.clock.now()
+  const before = await read($, alerted)
+  const { fire, alerted: still } = stuckAlerts(await read($, agents), await read($, activity), before, t)
+  for (const one of fire) alert($, one.text)
+  if (JSON.stringify(still) !== JSON.stringify(before)) await update($, alerted, () => still)
+}
+
 async function tick($: EngineInterface) {
   ticks += 1
-  if (ticks % LIST_EVERY === 0) await refresh($)
+  if (ticks % LIST_EVERY === 0) {
+    await refresh($)
+    await checkStuck($).catch(() => undefined)
+  }
   if (ticks % SHELL_EVERY === 0) await pollShells($).catch(() => undefined)
   const isShellBusy = (await read($, shells)).some(one => one.status === 'running')
   const isTaskBusy = Object.values(await read($, taskLogs)).some(log => log.steps.at(-1)?.status === 'running')
@@ -449,7 +477,8 @@ async function stop($: EngineInterface, row: AgentRow) {
   await refresh($)
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  alertMode = alertModeOf(options?.alerts)
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'agent-hub', description: 'Open Agent Hub: context, tasks and subagents' })
     await $.tool
@@ -523,7 +552,10 @@ export const register: Register = on => {
     }
     const tokens = e.context.tokens
     if (tokens !== undefined) {
-      await update($, contextFill, () => ({ tokens, window: e.context.window })).catch(() => undefined)
+      const reading = { tokens, window: e.context.window }
+      const said = contextAlert(await read($, contextFill).catch(() => null), reading)
+      await update($, contextFill, () => reading).catch(() => undefined)
+      if (said !== undefined) alert($, said)
     }
 
     return next(e)
