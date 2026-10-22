@@ -4,6 +4,7 @@ import { describe, expect, test } from 'claude-code/testing'
 import {
   applyList,
   applyTurnComplete,
+  isPersonOrigin,
   applyTurnStart,
   elapsedMs,
   formatElapsed,
@@ -128,5 +129,19 @@ describe('roster', () => {
     expect(formatElapsed(42_000)).toBe('0:42')
     expect(formatElapsed(125_000)).toBe('2:05')
     expect(formatElapsed(3_723_000)).toBe('1:02:03')
+  })
+
+  test("only the person's prompts start a task: a notification or another session's message does not", () => {
+    expect(isPersonOrigin({ kind: 'composer' })).toBe(true)
+    expect(isPersonOrigin({ kind: 'bridge' })).toBe(true)
+    expect(isPersonOrigin({ kind: 'plugin', name: 'agent-hub', asUser: true })).toBe(true)
+    expect(isPersonOrigin({ kind: 'unclassified' })).toBe(true)
+    expect(isPersonOrigin(undefined)).toBe(true)
+    expect(isPersonOrigin({ kind: 'task-notification' })).toBe(false)
+    expect(isPersonOrigin({ kind: 'peer' })).toBe(false)
+    expect(isPersonOrigin({ kind: 'peer-send-message' })).toBe(false)
+    expect(isPersonOrigin({ kind: 'observer' })).toBe(false)
+    expect(isPersonOrigin({ kind: 'auto-continuation' })).toBe(false)
+    expect(isPersonOrigin({ kind: 'plugin', name: 'other' })).toBe(false)
   })
 })

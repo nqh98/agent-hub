@@ -7,6 +7,16 @@ export type TreeLine = { row: AgentRow; depth: number }
 
 export const MAX_AGENTS = 50
 
+// Where a submission came from, as the task count reads it: a background
+// task's notification, another session's message or an observer's report is
+// the engine's, and starts no task; nor does another plugin's own prompt.
+const ENGINE_ORIGINS = new Set([
+  'task-notification', 'peer', 'peer-send-message', 'projects-relay', 'coordinator', 'observer', 'observer-activity', 'auto-continuation',
+])
+
+export const isPersonOrigin = (origin: { kind: string; name?: string; asUser?: true } | undefined): boolean =>
+  origin === undefined || (origin.kind === 'plugin' ? origin.asUser === true : !ENGINE_ORIGINS.has(origin.kind))
+
 // How long a turn.complete outranks a list snapshot that still says the agent
 // runs: the list catches up a moment after the turn's end.
 const END_GRACE_MS = 5000
