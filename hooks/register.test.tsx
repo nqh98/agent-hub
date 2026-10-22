@@ -1026,3 +1026,33 @@ test('with no agent card, the focus ring starts on the first shell', async ($, o
   const focused = (await ui.findAll({ type: 'Button' })).filter(one => one.props.autoFocus === true)
   expect(focused.map(one => one.key)).toEqual(['shell:u1'])
 })
+
+test('a shell whose log the pane cannot find says so, then shows the output at its end', async ($, on) => {
+  const { clock } = engine(on)
+  let finish = () => {}
+  on('tool.call', async () => {
+    await new Promise<void>(resolve => (finish = resolve))
+
+    return { result: { stdout: 'built\n', stderr: '', interrupted: false }, text: 'ok' }
+  })
+  // No tasks dir to be found: no fs hook answers.
+  const start = starts(on)
+  await start($)
+  const ui = await $.ui.mount({ plugin: 'agent-hub', surface: 'terminal', component: 'Pane', requestId: 'agent-hub', props: PANE_PROPS })
+
+  const ran = $.tool.call({ tool: 'Bash', command: 'npm run build', tool_use_id: 'u1' } as never)
+  await clock.settle()
+  expect(await ui.find({ type: 'Text', text: 'waiting for output…' })).toBeDefined()
+
+  await clock.advance(11_000)
+  expect(await ui.find({ type: 'Text', text: 'live output unavailable · shown when it ends' })).toBeDefined()
+  await ui.press({ key: 'shell:u1' })
+  expect(await ui.find({ type: 'Text', text: 'live output unavailable · shown when it ends' })).toBeDefined()
+
+  finish()
+  await ran
+  await clock.settle()
+  expect(await ui.find({ type: 'Text', text: 'built' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /live output unavailable/ })).toBeUndefined()
+  await ui.unmount()
+})

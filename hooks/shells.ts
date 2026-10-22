@@ -170,3 +170,16 @@ export const isStoppable = (row: ShellRow): boolean =>
 /** Every shell of the session, newest first, as the detail lists them. */
 export const shellHistory = (shells: readonly ShellRow[]): ShellRow[] =>
   [...shells].sort((a, b) => b.startedAt - a.startedAt)
+
+/**
+ * How long a running command may go without a log file before the pane says
+ * it cannot follow it. The engine opens a command's file as it starts, so a
+ * quiet command has one; none by now means the tasks dir was not found.
+ */
+export const OUTPUT_GRACE_MS = 10_000
+
+/** What a running shell with no output yet reads as: waiting, or not followed live. */
+export const waitingNote = (row: ShellRow, now: number): string =>
+  row.taskId === undefined && now - row.startedAt >= OUTPUT_GRACE_MS
+    ? 'live output unavailable · shown when it ends'
+    : 'waiting for output…'
