@@ -110,7 +110,15 @@ export type RateLimitRow = {
   resetsAt?: string
 }
 
-export type ShellStatus = 'running' | 'done' | 'failed' | 'stopped'
+/** The main conversation's latest model request: when it ended and how its input was cached. */
+export type CacheReading = {
+  at: number
+  input: number
+  read: number
+  write: number
+}
+
+export type ShellStatus ='running' | 'done' | 'failed' | 'stopped'
 /** One Bash command an agent ran: the command pinned, its log's latest lines under it. */
 export type ShellRow = {
   /** The call's tool_use_id. */
@@ -154,6 +162,8 @@ declare module 'claude-code' {
       confirmStop: string | null
       /** The context window the session's last response filled: its tokens and its size; null before a reading. */
       context: { tokens: number; window: number } | null
+      /** The prompt cache as the main conversation's latest request left it; null before one. */
+      cache: CacheReading | null
       /** What the whole session has cost, in US dollars, as /cost totals it; null before a reading. */
       sessionCostUsd: number | null
       /** The account's rate-limit windows, five hours first; empty off a subscription or before a reading. */

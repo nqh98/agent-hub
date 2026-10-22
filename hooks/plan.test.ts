@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { applyPlan, applyStepUsage, currentTaskAfter, nextPlan, planFromTaskList, stampStarts, applyUsage, formatTokens, limitParts, formatUsd, planProgress, settleLive, totalTokens, usageOf } from './plan'
+import { applyPlan, applyStepUsage, cacheParts, cacheReading, currentTaskAfter, nextPlan, planFromTaskList, stampStarts, applyUsage, formatTokens, limitParts, formatUsd, planProgress, settleLive, totalTokens, usageOf } from './plan'
 import { applyTurnBegin, applyTurnEnd } from './steps'
 
 const usage = (input: number, output: number, model = 'claude-sonnet-5-5') => ({
@@ -173,5 +173,15 @@ describe('tokens', () => {
     expect(formatTokens(8_250)).toBe('8.3k')
     expect(formatTokens(57_340)).toBe('57k')
     expect(formatTokens(1_250_000)).toBe('1.3M')
+  })
+
+  test('the cache line reads the latest request’s hit share and counts down its 5 minutes', () => {
+    const reading = cacheReading({ input_tokens: 800, output_tokens: 50, cache_read_input_tokens: 9000, cache_creation_input_tokens: 200, model: 'm' }, 1_000_000)
+    expect(cacheParts(reading, 1_000_000)).toEqual({ hit: '90%', leftMs: 300_000 })
+    expect(cacheParts(reading, 1_079_000).leftMs).toBe(221_000)
+    expect(cacheParts(reading, 1_400_000).leftMs).toBe(0)
+    expect(cacheParts(reading, 0).leftMs).toBe(300_000)
+    expect(cacheParts(cacheReading({ input_tokens: 0, output_tokens: 0, model: 'm' }, 0), 0).hit).toBe('0%')
+    expect(cacheParts(cacheReading({ input_tokens: 999, output_tokens: 0, cache_read_input_tokens: 1, model: 'm' }, 0), 0).hit).toBe('<1%')
   })
 })

@@ -621,6 +621,36 @@ test('the context bar fills the pane width in proportion to the window', async (
   expect(await ui.find({ type: 'Text', text: '░'.repeat(62) })).toBeDefined()
 })
 
+test('the main conversation’s cache hit and countdown sit under the context bar', async ($, on) => {
+  const { clock } = engine(on)
+  on('turn.step', async function* (_$, e) {
+    return {
+      turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn',
+      usage: { input_tokens: 800, output_tokens: 50, cache_read_input_tokens: 9000, cache_creation_input_tokens: 200, model: 'claude-sonnet-5-5' },
+    } as never
+  })
+  // The countdown moves with the pane's tick, which session.start sets going.
+  on('command.register', () => ({ value: undefined }) as never)
+  on('ui.open', () => ({ value: undefined }) as never)
+  on('session.start', (_$, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.session.measure({ context: { tokens: 230_000, window: 1_000_000, percent: 23 }, rateLimits: [], changed: ['context'] } as never)
+  const ui = await $.ui.mount({ plugin: 'agent-hub', surface: 'terminal', component: 'Pane', requestId: 'agent-hub', props: PANE_PROPS })
+  expect(await ui.find({ type: 'Text', text: /^Cache/ })).toBeUndefined()
+
+  const steps = $.turn.step({ turnId: 't1', index: 0, model: 'claude-sonnet-5-5', messageCount: 1 } as never)
+  for await (const _chunk of steps as AsyncIterable<unknown>) {
+    // the stream passes through untouched
+  }
+  await clock.settle()
+  await clock.advance(1_000)
+  expect(await ui.find({ type: 'Text', text: 'Cache: 90% hit' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: ' · ↻ 4:59' })).toBeDefined()
+
+  await clock.advance(300_000)
+  expect(await ui.find({ type: 'Text', text: ' · expired' })).toBeDefined()
+})
+
 test('the rate-limit windows are drawn five hours first, names and reset marks in orange', async ($, on) => {
   const { clock } = engine(on)
   const resetsAt = (hours: number) => new Date(1_000_000 + hours * 3_600_000).toISOString()

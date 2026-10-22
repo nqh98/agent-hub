@@ -1,4 +1,4 @@
-import type { AgentActivity, RateLimitRow, TodoItem, TodoStatus, TokenUsage } from '../types'
+import type { AgentActivity, CacheReading, RateLimitRow, TodoItem, TodoStatus, TokenUsage } from '../types'
 import { redact } from './steps'
 import type { Activity } from './steps'
 
@@ -203,7 +203,29 @@ export const usageOf = (one: AgentActivity | undefined): TokenUsage | undefined 
 export const totalTokens = (usage: TokenUsage): number =>
   usage.input + usage.output + usage.cacheRead + usage.cacheWrite
 
-export const formatUsd = (usd: number): string => `$${usd < 10 ? usd.toFixed(2) : usd.toFixed(0)}`
+// ponytail: the default 5-minute TTL; a 1-hour cache reads as expired early until the engine reports its TTL.
+export const CACHE_TTL_MS = 5 * 60_000
+
+export const cacheReading = (usage: TurnUsageIn, at: number): CacheReading => ({
+  at,
+  input: usage.input_tokens,
+  read: usage.cache_read_input_tokens ?? 0,
+  write: usage.cache_creation_input_tokens ?? 0,
+})
+
+/** `92%` of the latest request's input read from cache, and the time left before the cache expires (0 once it has). */
+export function cacheParts(reading: CacheReading, nowMs: number): { hit: string; leftMs: number } {
+  const total = reading.input + reading.read + reading.write
+  const percent = total > 0 ? (reading.read / total) * 100 : 0
+
+  return {
+    hit: `${percent > 0 && percent < 1 ? '<1' : Math.round(percent)}%`,
+    // A clock read before the request (the pane's last tick) still counts no more than the TTL.
+    leftMs: Math.min(CACHE_TTL_MS, Math.max(0, reading.at + CACHE_TTL_MS - nowMs)),
+  }
+}
+
+export const formatUsd =(usd: number): string => `$${usd < 10 ? usd.toFixed(2) : usd.toFixed(0)}`
 
 // The windows' short names, in the order they are drawn; another reads as its own name, after them.
 const LIMIT_NAMES: Record<string, string> = { five_hour: '5h', seven_day: '7d', spend_limit: 'spend' }

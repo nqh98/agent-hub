@@ -24,6 +24,9 @@ import {
   stampStarts,
   applyStepUsage,
   applyUsage,
+  CACHE_TTL_MS,
+  cacheParts,
+  cacheReading,
   formatTokens,
   formatUsd,
   limitParts,
@@ -127,6 +130,7 @@ const EMPTY_USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, model: '
 const task = atom({ plugin: 'agent-hub', key: 'task' } as const, 0)
 const showAll = atom({ plugin: 'agent-hub', key: 'showAll' } as const, false)
 const contextFill = atom({ plugin: 'agent-hub', key: 'context' } as const, null)
+const promptCache = atom({ plugin: 'agent-hub', key: 'cache' } as const, null)
 // The context bar: the used part solid in Claude's orange, red once the
 // window is 80% full (compaction is near); the rest a light shade.
 const BAR_COLOR = 'claude'
@@ -367,7 +371,10 @@ async function tick($: EngineInterface) {
   const isShellBusy = (await read($, shells)).some(one => one.status === 'running')
   const isTaskBusy = Object.values(await read($, taskLogs)).some(log => log.steps.at(-1)?.status === 'running')
   const isTaskOpen = (await read($, tasks)).some(item => item.status === 'in_progress')
-  if (hasActive(await read($, agents)) || isTaskBusy || isTaskOpen || isShellBusy) {
+  // The cache countdown ticks until a tick past its expiry.
+  const cache = await read($, promptCache)
+  const isCacheWarm = cache !== null && (await read($, now)) < cache.at + CACHE_TTL_MS
+  if (hasActive(await read($, agents)) || isTaskBusy || isTaskOpen || isShellBusy || isCacheWarm) {
     const t = await $.clock.now()
     await update($, now, () => t)
   }
@@ -519,13 +526,17 @@ export const register: Register = on => {
   })
 
   // Each model request of a subagent's turn: its tokens count at once, not
-  // only when the turn ends. The stream passes through untouched first.
+  // only when the turn ends; the main conversation's sets the cache line.
+  // The stream passes through untouched first.
   on('turn.step', async function* ($, e, next) {
     const result = yield* next(e)
     const agentId = e.agentId
     const usage = result.usage
     if (agentId !== undefined && usage !== null) {
       await update($, activity, a => applyStepUsage(a, agentId, usage)).catch(() => undefined)
+    } else if (usage !== null) {
+      const t = await $.clock.now()
+      await update($, promptCache, () => cacheReading(usage, t)).catch(() => undefined)
     }
 
     return result
@@ -717,6 +728,7 @@ export const register: Register = on => {
     const expanded = await read($, isExpanded)
     const cost = await read($, sessionCost)
     const fill = await read($, contextFill)
+    const cache = await read($, promptCache)
     const limits = await read($, rateLimits)
     const isAll = await read($, showAll)
     const checklist = await read($, tasks)
@@ -1323,6 +1335,22 @@ export const register: Register = on => {
         </Box>
       )
     })()
+    // Under the context bar: how much of the latest request the cache served, and how long it stays warm.
+    const cacheGroup = (() => {
+      if (cache === null) return undefined
+      const { hit, leftMs } = cacheParts(cache, t)
+
+      return (
+        <Box marginTop={1}>
+          <Text>
+            <Text bold>
+              <Text color={TITLE_COLOR}>Cache</Text>: {hit} hit
+            </Text>
+            <Text dimColor>{leftMs > 0 ? ` · ↻ ${formatElapsed(leftMs)}` : ' · expired'}</Text>
+          </Text>
+        </Box>
+      )
+    })()
     const rule = <Text dimColor>{'─'.repeat(Math.max(1, columns))}</Text>
 
     // The header, centred: Claude's mascot in orange, the pane's name drawn
@@ -1359,6 +1387,7 @@ export const register: Register = on => {
           {header}
           {rule}
           {contextGroup}
+          {cacheGroup}
           {rule}
           {taskGroup}
           {/* A rule between the groups, the pane's full width. */}
