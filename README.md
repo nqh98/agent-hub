@@ -102,6 +102,7 @@ Works when you sign in with an API key, where Claude Code's own Remote Control i
 
 - Needs `node` and `ssh` on the PATH (macOS has `ssh`); no account, nothing to install.
 - The QR code is drawn with half blocks, light on dark whatever the theme; **hide QR** folds it away, and a pane too narrow for it says so instead. A terminal with extra line spacing breaks the code up: open the link instead.
+- If the page cannot reach the session for over a minute (the remote stopped, the tunnel dropped, or the session ended), it turns into an Oops page that says to run `/agent-hub-remote` again and open the new link, and stops asking the old address. A phone that was asleep checks first, so waking it does not show Oops by mistake.
 - The tunnel's address is new at each start, and localhost.run's free tier may change it while it runs: the pane then shows the new link.
 - The link carries a secret token, kept across sessions. Anyone with the link can prompt the session, so keep it to yourself.
 - Type `/` for the session's commands and `@` for the project's files (as git lists them); a pick fills the box. A command runs as if typed at the terminal and its output is the answer; one that draws a picker there (`/model`, `/resume`, `/config`…) says so instead. The files a prompt mentions with `@` go to the model beside it, as Claude Code does for a typed prompt (text files inside the project, 100 kB each).
