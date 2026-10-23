@@ -118,22 +118,22 @@ export type CacheReading = {
   write: number
 }
 
-export type ShellStatus ='running' | 'done' | 'failed' | 'stopped'
-/** One Bash command an agent ran: the command pinned, its log's latest lines under it. */
+export type ShellStatus = 'running' | 'done' | 'failed' | 'stopped'
+/** A shell the session spawned: a Bash command left running in the background, its log watched. */
 export type ShellRow = {
   /** The call's tool_use_id. */
   id: string
   command: string
   description?: string
-  /** The subagent that ran it; absent for the main conversation. */
+  /** The subagent that spawned it; absent for the main conversation. */
   agentId?: string
-  /** The prompt it ran under (the `task` count). */
+  /** The prompt it was spawned under (the `task` count). */
   task: number
   status: ShellStatus
-  /** Run in the background, or moved there (Ctrl+B, a timeout). */
-  isBackground: boolean
-  /** The engine's id for the command, `b…`: its log is `<tasks dir>/<taskId>.output`. */
-  taskId?: string
+  /** The engine's id for the command, `b…`. */
+  taskId: string
+  /** Its log, as the call's result named it; absent, `<tasks dir>/<taskId>.output`. */
+  logPath?: string
   startedAt: number
   endedAt?: number
   exitCode?: number
@@ -141,6 +141,16 @@ export type ShellRow = {
   tail: string[]
   /** The log's size when last read; it is read again only when that changes. */
   size?: number
+}
+/** Remote control as the pane shows it: the helper starting, its tunnel up, or why it failed. */
+export type RemoteStatus = {
+  status: 'off' | 'starting' | 'on' | 'error'
+  /** The tunnel's address with the token: what the phone opens. */
+  link?: string
+  /** The helper's latest error line. */
+  note?: string
+  /** The link's QR code folded away in the pane. */
+  isQrHidden?: boolean
 }
 declare module 'claude-code' {
   interface PluginState {
@@ -168,7 +178,7 @@ declare module 'claude-code' {
       sessionCostUsd: number | null
       /** The account's rate-limit windows, five hours first; empty off a subscription or before a reading. */
       rateLimits: RateLimitRow[]
-      /** The session's Bash commands, oldest first: the latest MAX_SHELLS, every running one kept. */
+      /** The shells the session spawned, oldest first: the latest MAX_SHELLS, every running one kept. */
       shells: ShellRow[]
       /** The running agents the pane has said may be stuck, until they recover. */
       alerted: string[]
@@ -178,6 +188,8 @@ declare module 'claude-code' {
       showAll: boolean
       /** Running agents' cards list their latest steps; off, only what runs now. Finished cards stay folded. */
       isExpanded: boolean
+      /** Remote control; off again after a reload, which ends the helper. */
+      remote: RemoteStatus
     }
   }
 }

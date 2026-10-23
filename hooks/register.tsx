@@ -1,10 +1,11 @@
 import { atom, read, update } from 'claude-code'
-import type { AgentInfo, EngineInterface, Register, ToolCallResult } from 'claude-code'
+import type { AgentInfo, EngineInterface, HookStream, ProcessSpawnChunk, ProcessSpawnResult, Register, ToolCallResult } from 'claude-code'
 
 import type {
   AgentActivity,
   AgentRow,
   AgentRowStatus,
+  RemoteStatus,
   ShellRow,
   ShellStatus,
   StepRow,
@@ -38,6 +39,9 @@ import {
   totalTokens,
   usageOf,
 } from './plan'
+import { commandsFor, fileContext, historyOf, isTerminalOnly, mentionsOf, parseHelperLine, parseSlash, projectPath, shareUrl, snapshot } from './remote'
+import type { RemoteResult, RemoteTurn } from './remote'
+import { qrEncode, qrLines } from './qr'
 import {
   applyList,
   applyTurnComplete,
@@ -46,23 +50,20 @@ import {
   formatElapsed,
   hasActive,
   isEnded,
+  isPersonOrigin,
   latestTask,
   visibleTree,
 } from './roster'
 import {
-  claimFiles,
   clip,
   commandLine,
   DONE_TAIL_LINES,
-  endStatus,
-  finalOutput,
   MAX_LOG_BYTES,
   patchRunning,
   readLog,
-  shellFiles,
+  spawnedOf,
   startShell,
   TAIL_LINES,
-  toBackground,
   visibleShells,
 } from './shells'
 import {
@@ -111,6 +112,37 @@ const CHECKLIST_SCHEMA = {
 // The calls that write an agent's plan.
 const PLAN_TOOLS = new Set(['TodoWrite', 'TaskCreate', 'TaskUpdate'])
 
+// Remote control: a phone drives the session through a page the helper
+// (remote/server.mjs) serves over a localhost.run tunnel.
+const REMOTE = 'remote'
+const REMOTE_TOOL = `mcp__agent-hub__${REMOTE}`
+const REMOTE_COMMAND = 'agent-hub-remote'
+const REMOTE_SCHEMA = {
+  type: 'object',
+  properties: {
+    action: { type: 'string', enum: ['start', 'stop', 'status'], description: 'start the remote link, stop it, or say how it stands.' },
+  },
+  required: ['action'],
+} as const
+// The token outlives the session; the tunnel's address is new at each start.
+const STORE_TOKEN = 'remoteToken'
+// How long the tool waits for the link: a hook has 10 s of its own time and
+// sleeping counts. A slower start answers that it is starting.
+const REMOTE_START_MS = 7_000
+// The view is synced every SYNC_EVERY ticks.
+const SYNC_EVERY = 4
+// What the phone's typeahead lists: the commands, and the project's files
+// (as git knows them), read again this often and sent only when they change.
+const CATALOG_MS = 30_000
+// The phone's history is read again after each turn, and this often besides
+// (a command typed at the terminal starts no turn).
+const HISTORY_MS = 15_000
+const MAX_CATALOG_FILES = 5_000
+// The files a phone prompt's @ mentions bring along, as Claude Code would for a typed one.
+const MAX_MENTIONS = 10
+const MAX_MENTION_BYTES = 100_000
+const MAX_MENTION_TOTAL = 300_000
+
 const agents = atom({ plugin: 'agent-hub', key: 'agents' } as const, {})
 const activity = atom({ plugin: 'agent-hub', key: 'activity' } as const, {})
 const tasks = atom({ plugin: 'agent-hub', key: 'tasks' } as const, [])
@@ -141,13 +173,14 @@ const sessionCost = atom({ plugin: 'agent-hub', key: 'sessionCostUsd' } as const
 const rateLimits = atom({ plugin: 'agent-hub', key: 'rateLimits' } as const, [])
 const shells = atom({ plugin: 'agent-hub', key: 'shells' } as const, [])
 const alerted = atom({ plugin: 'agent-hub', key: 'alerted' } as const, [])
+const remote = atom({ plugin: 'agent-hub', key: 'remote' } as const, { status: 'off' })
 // The steps a running agent's expanded card lists, and the calls under its
 // item in progress: few, so a card stays short; a finished agent's card
 // folds to one line, and the detail view lists them all.
 const CARD_STEPS = 3
 const CARD_TASK_STEPS = 3
-// The shells' logs are read every SHELL_EVERY ticks while one runs; the
-// tasks dir is looked for again every SCAN_EVERY polls until found.
+// The spawned shells' logs are read every SHELL_EVERY ticks while one runs;
+// the tasks dir, when needed, is looked for every SCAN_EVERY polls until found.
 const SHELL_EVERY = 2
 const SCAN_EVERY = 8
 // The size the pane asks for: columns docked beside a fullscreen transcript,
@@ -226,11 +259,9 @@ let ticks = 0
 // How the person asked to hear of a stuck agent or a full context: the
 // `alerts` option, read as the module registers.
 let alertMode: AlertMode = 'toast'
-// Where the engine writes the session's command logs, once found, and the
-// log files already given out or passed over. The module's own: a reload
-// looks again.
+// Where the engine writes the session's command logs, when a result did not
+// name a shell's own. The module's own: a reload looks again.
 let tasksDir: string | undefined
-let seenFiles: ReadonlySet<string> = new Set()
 let polls = 0
 
 const sanitize = (path: string) => path.replace(/[^a-zA-Z0-9]/g, '-')
@@ -257,50 +288,21 @@ async function findTasksDir($: EngineInterface): Promise<string | undefined> {
   return undefined
 }
 
-// Found: the logs there before any shell now waiting began are someone else's.
-async function useTasksDir($: EngineInterface, dir: string) {
-  if (tasksDir === dir) return
-  tasksDir = dir
-  const waiting = (await read($, shells)).filter(one => one.status === 'running' && one.taskId === undefined)
-  const since = Math.min(await $.clock.now(), ...waiting.map(one => one.startedAt))
-  const entries = await $.fs.list(dir).catch(() => [])
-  seenFiles = new Set([...seenFiles, ...shellFiles(entries, since)])
-}
-
-// Reads each running shell's log, when it grew, and gives new logs to the shells waiting for one.
+// Reads each running shell's log when it grew; the log's exit line ends the shell.
 async function pollShells($: EngineInterface) {
-  const before = await read($, shells)
-  if (!before.some(one => one.status === 'running')) return
-  if (tasksDir === undefined) {
-    if (polls++ % SCAN_EVERY !== 0) return
-    const found = await findTasksDir($)
-    if (found === undefined) return
-    await useTasksDir($, found)
+  const running = (await read($, shells)).filter(one => one.status === 'running')
+  if (running.length === 0) return
+  if (tasksDir === undefined && running.some(one => one.logPath === undefined) && polls++ % SCAN_EVERY === 0) {
+    tasksDir = await findTasksDir($)
   }
-  const dir = tasksDir!
-  let list = before
-  if (list.some(one => one.status === 'running' && !one.isBackground && one.taskId === undefined)) {
-    const entries = await $.fs.list(dir).catch(() => undefined)
-    if (entries !== undefined) {
-      const claimed = claimFiles(list, shellFiles(entries), seenFiles)
-      seenFiles = claimed.seen
-      if (claimed.shells.some((one, i) => one.taskId !== list[i]?.taskId)) {
-        const given = new Map(claimed.shells.map(one => [one.id, one.taskId]))
-        list = await update($, shells, rows =>
-          rows.map(one => (one.taskId === undefined && given.get(one.id) !== undefined ? { ...one, taskId: given.get(one.id) } : one)),
-        )
-      }
-    }
-  }
-  for (const row of list) {
-    if (row.status !== 'running' || row.taskId === undefined) continue
-    const path = `${dir}/${row.taskId}.output`
+  for (const row of running) {
+    const path = row.logPath ?? (tasksDir === undefined ? undefined : `${tasksDir}/${row.taskId}.output`)
+    if (path === undefined) continue
     const stat = await $.fs.stat(path).catch(() => undefined)
     const t = await $.clock.now()
-    // A foreground log goes as its command ends, the result telling how; a
-    // background one gone is a command stopped.
+    // The log gone with no exit line: the command was stopped.
     if (stat === undefined) {
-      if (row.isBackground) await update($, shells, rows => patchRunning(rows, row.id, { status: 'stopped', endedAt: t }))
+      await update($, shells, rows => patchRunning(rows, row.id, { status: 'stopped', endedAt: t }))
       continue
     }
     if (stat.size === row.size) continue
@@ -311,36 +313,11 @@ async function pollShells($: EngineInterface) {
     }
     const text = await $.fs.read(path).catch(() => undefined)
     if (typeof text !== 'string') continue
-    const log = readLog(text)
-    const exitCode = row.isBackground ? log.exitCode : undefined
+    const { tail, exitCode } = readLog(text)
     const end: Partial<ShellRow> =
       exitCode === undefined ? {} : { status: exitCode === 0 ? 'done' : 'failed', exitCode, endedAt: t }
-    await update($, shells, rows => patchRunning(rows, row.id, { tail: log.tail, size: stat.size, ...end }))
+    await update($, shells, rows => patchRunning(rows, row.id, { tail, size: stat.size, ...end }))
   }
-}
-
-// A command's call settled: moved to the background it keeps running under
-// the id the result gives; otherwise it ended, its output the result's own.
-async function settleShell($: EngineInterface, id: string, ran: ToolCallResult) {
-  const record = typeof ran.result === 'object' && ran.result !== null ? (ran.result as Record<string, unknown>) : {}
-  const taskId = typeof record.backgroundTaskId === 'string' ? record.backgroundTaskId : undefined
-  if (taskId !== undefined && ran.deny === undefined) {
-    const named = /(\/\S+)\/b[a-z0-9]+\.output/.exec(ran.text ?? '')?.[1]
-    if (named !== undefined && tasksDir === undefined) await useTasksDir($, named)
-    await update($, shells, rows => toBackground(rows, id, taskId))
-
-    return
-  }
-  const t = await $.clock.now()
-  const { output, exitCode } = finalOutput(ran.result, ran.text)
-  const { tail } = readLog(output)
-  const status = endStatus(ran)
-  const code = exitCode ?? (status === 'done' ? 0 : undefined)
-  await update($, shells, rows =>
-    rows.map(one =>
-      one.id === id ? { ...one, status, endedAt: t, exitCode: code, tail: tail.length > 0 ? tail : one.tail } : one,
-    ),
-  )
 }
 
 // Reads the engine's roster and folds it in, writing only on a change so an
@@ -396,6 +373,7 @@ async function tick($: EngineInterface) {
     await checkStuck($).catch(() => undefined)
   }
   if (ticks % SHELL_EVERY === 0) await pollShells($).catch(() => undefined)
+  if (ticks % SYNC_EVERY === 0) void sync($).catch(() => undefined)
   const isShellBusy = (await read($, shells)).some(one => one.status === 'running')
   const isTaskBusy = Object.values(await read($, taskLogs)).some(log => log.steps.at(-1)?.status === 'running')
   const isTaskOpen = (await read($, tasks)).some(item => item.status === 'in_progress')
@@ -477,6 +455,284 @@ async function stop($: EngineInterface, row: AgentRow) {
   await refresh($)
 }
 
+// The helper's run while remote control is on, and the socket it listens on
+// for the mod once it said its port. Module variables: a reload ends the
+// helper with the module, and the pane reads off again (session.start).
+let helper: HookStream<ProcessSpawnChunk, ProcessSpawnResult> | undefined
+let helperSocket: string | undefined
+let isStopping = false
+let isSyncing = false
+// The main conversation, for the phone: in a turn or not, the turn it runs
+// (its prompt and start), its latest answer, and the phone's prompts not yet started.
+let isMainBusy = false
+let mainTurn: RemoteTurn | null = null
+let lastResult: RemoteResult | null = null
+let queued: string[] = []
+// A slash command the phone ran: the turn it starts (a skill, a prompt
+// command) is named by what the phone sent, so its pin finds the answer.
+let phoneCommand: string | undefined
+let turnSinceCommand = false
+// The files each phone prompt mentions, by its text, for prompt.submit to attach.
+const mentioned = new Map<string, string[]>()
+// The catalog as last sent, and when it was last read.
+let catalogSent = ''
+// The history as last sent, when it was last read, and whether a turn has moved it since.
+let historySent = ''
+let historyAt = 0
+let isHistoryStale = true
+// The link's QR code as drawn last: a render redraws it often, the link seldom changes.
+let qrDrawn: { link: string; lines: string[] } | undefined
+let catalogAt = 0
+
+// The link's QR code as pane lines; none when too long for a code.
+function qrOf(link: string): string[] {
+  if (qrDrawn?.link !== link) {
+    const code = qrEncode(link)
+    qrDrawn = { link, lines: code === undefined ? [] : qrLines(code) }
+  }
+
+  return qrDrawn.lines
+}
+
+const describeRemote = (state: RemoteStatus): string => {
+  switch (state.status) {
+    case 'on':
+      return `Remote control is on. Open on the phone: ${state.link ?? '(no link yet)'}`
+    case 'starting':
+      return 'Remote control is starting; the link shows in the Agent Hub pane, or ask for status again in a few seconds.'
+    case 'error':
+      return `Remote control failed: ${state.note ?? 'the helper stopped'}`
+    default:
+      return 'Remote control is off.'
+  }
+}
+
+async function startRemote($: EngineInterface) {
+  if (helper !== undefined) return
+  // A new helper has no catalog yet, nor any history.
+  catalogSent = ''
+  catalogAt = 0
+  historySent = ''
+  isHistoryStale = true
+  const token = await $.store.get(STORE_TOKEN)
+  // A socket path stays short: the per-user temp directory, the session's id cut.
+  const dir = ((await $.env.get('TMPDIR')) ?? '/tmp').replace(/\/+$/, '')
+  const socket = `${dir}/agent-hub-${(await $.session.id()).slice(0, 8)}.sock`
+  const env: Record<string, string> = { AGENT_HUB_SOCKET: socket }
+  if (typeof token === 'string') env.AGENT_HUB_TOKEN = token
+
+  await update($, remote, () => ({ status: 'starting' }))
+  isStopping = false
+  const run = $.process.spawn({ argv: ['node', `${$.plugin.root}/remote/server.mjs`], env })
+  helper = run
+  void watchHelper($, run, socket)
+}
+
+// Reads the helper's lines until it exits, the pane following what it says.
+async function watchHelper($: EngineInterface, run: HookStream<ProcessSpawnChunk, ProcessSpawnResult>, socket: string) {
+  // The helper says its token first, the kept one or a new one.
+  let token = ''
+  let pending = ''
+  let failure: string | undefined
+  // The last thing it wrote to stderr: why it died, when it did not say.
+  let complaint: string | undefined
+  try {
+    for await (const { stream, text } of run) {
+      if (stream === 'stderr') {
+        complaint = text.trim().split('\n').at(-1) || complaint
+        continue
+      }
+      const lines = (pending + text).split('\n')
+      pending = lines.pop() ?? ''
+      for (const line of lines) {
+        const event = parseHelperLine(line)
+        if (event === undefined) continue
+        if (event.kind === 'token') {
+          token = event.token
+          await $.store.set(STORE_TOKEN, token)
+        } else if (event.kind === 'port') {
+          helperSocket = socket
+        } else if (event.kind === 'url') {
+          // A new address, at start or mid-run: the phone needs the new link.
+          const link = shareUrl(event.url, token)
+          // Up again after a retry: the earlier error is past.
+          await update($, remote, ({ note: _past, ...state }) => ({ ...state, status: 'on' as const, link }))
+        } else {
+          failure = event.text
+          const note = event.text
+          await update($, remote, state => ({ ...state, note }))
+        }
+      }
+    }
+  } catch (error) {
+    failure = `the helper did not start: ${String(error)}`
+  }
+  if (helper !== run) return
+  helper = undefined
+  helperSocket = undefined
+  const note = failure ?? complaint ?? 'the helper stopped'
+  await update($, remote, () => (isStopping ? { status: 'off' } : { status: 'error', note }))
+}
+
+async function stopRemote($: EngineInterface) {
+  const socket = helperSocket
+  isStopping = true
+  helperSocket = undefined
+  if (socket !== undefined) {
+    await $.http.fetch('http://agent-hub/quit', { method: 'POST', socketPath: socket }).catch(() => undefined)
+  }
+  // Not yet listening: ending the loop kills it. Not awaited, as the loop
+  // may wait on the child's next line; a deaf helper ends itself unsynced.
+  if (socket === undefined) void helper?.return(undefined as never).catch(() => undefined)
+  if (helper === undefined) await update($, remote, () => ({ status: 'off' }))
+}
+
+// Sends the pane's view to the helper and submits the prompts the phone sent.
+async function sync($: EngineInterface) {
+  const socket = helperSocket
+  if (socket === undefined || isSyncing) return
+  isSyncing = true
+  try {
+    const view = snapshot({
+      now: await $.clock.now(),
+      context: await read($, contextFill),
+      costUsd: await read($, sessionCost),
+      rateLimits: await read($, rateLimits),
+      tasks: await read($, tasks),
+      agents: await read($, agents),
+      activity: await read($, activity),
+      shells: await read($, shells),
+      task: await read($, task),
+      busy: isMainBusy,
+      current: mainTurn,
+      queued,
+      result: lastResult,
+    })
+    const res = await $.http.fetch('http://agent-hub/sync', {
+      method: 'POST',
+      socketPath: socket,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        view,
+        catalog: await catalogOf($).catch(() => undefined),
+        history: await historyToSend($).catch(() => undefined),
+      }),
+    })
+    const prompts: unknown = res.ok ? JSON.parse(res.text).prompts : []
+    for (const text of Array.isArray(prompts) ? prompts : []) {
+      if (typeof text !== 'string' || text === '') continue
+      const slash = parseSlash(text)
+      if (slash !== undefined) void runPhoneCommand($, text, slash)
+      else void submitPhonePrompt($, text)
+    }
+    // The pane's waiting count reads `queued`, which no atom redraws.
+    if (Array.isArray(prompts) && prompts.length > 0) $.ui.invalidate('ui.render')
+  } finally {
+    isSyncing = false
+  }
+}
+
+// The main conversation's latest turns for the phone's history; undefined when unchanged since sent.
+async function historyToSend($: EngineInterface): Promise<unknown[] | undefined> {
+  const t = await $.clock.now()
+  if (!isHistoryStale && t - historyAt < HISTORY_MS) return undefined
+  isHistoryStale = false
+  historyAt = t
+  const turns = historyOf(await $.session.messages())
+  const json = JSON.stringify(turns)
+  if (json === historySent) return undefined
+  historySent = json
+
+  return turns
+}
+
+// The commands and files the phone's typeahead offers; undefined when unchanged since sent.
+async function catalogOf($: EngineInterface): Promise<{ commands: unknown[]; files: string[] } | undefined> {
+  const t = await $.clock.now()
+  if (catalogSent !== '' && t - catalogAt < CATALOG_MS) return undefined
+  catalogAt = t
+  const commands = commandsFor(await $.command.list())
+  const listed = await $.process
+    .run(['git', 'ls-files', '--cached', '--others', '--exclude-standard'], { cwd: await $.session.root(), timeoutMs: 5000 })
+    .catch(() => undefined)
+  const files = listed?.exitCode === 0 ? listed.stdout.split('\n').filter(Boolean).slice(0, MAX_CATALOG_FILES) : []
+  const json = JSON.stringify({ commands, files })
+  if (json === catalogSent) return undefined
+  catalogSent = json
+
+  return { commands, files }
+}
+
+// A phone's slash command: its output is the answer the phone pins; a command
+// that prompts the model starts a turn, answered at turn.complete.
+async function runPhoneCommand($: EngineInterface, text: string, slash: { name: string; args: string }) {
+  const at = async () => $.clock.now().catch(() => 0)
+  if (isTerminalOnly(slash.name)) {
+    lastResult = { prompt: text, text: `/${slash.name} draws a picker in the terminal: run it there.`, reason: 'error', at: await at() }
+
+    return
+  }
+  phoneCommand = text
+  turnSinceCommand = false
+  try {
+    const ran = await $.command.run({ command: slash.name, args: slash.args })
+    if (ran.text !== undefined && ran.text !== '') lastResult = { prompt: text, text: ran.text, reason: 'answer', at: await at() }
+    else if (!turnSinceCommand) lastResult = { prompt: text, text: `/${slash.name} ran.`, reason: 'answer', at: await at() }
+  } catch (error) {
+    lastResult = { prompt: text, text: `/${slash.name} failed: ${String(error)}`, reason: 'error', at: await at() }
+  } finally {
+    if (phoneCommand === text) phoneCommand = undefined
+    isHistoryStale = true
+  }
+}
+
+// A phone's prompt, its @ files read first for prompt.submit to attach (a
+// plugin's prompt has no @ expansion of its own); unread, the model still
+// sees the paths and can read them.
+async function submitPhonePrompt($: EngineInterface, text: string) {
+  queued = [...queued, text]
+  const files = await mentionedFiles($, text).catch(() => [])
+  if (files.length > 0) mentioned.set(text, files)
+  void $.prompt.submit({ text, asUser: true }).catch(() => {
+    queued = queued.filter(one => one !== text)
+    mentioned.delete(text)
+  })
+}
+
+async function mentionedFiles($: EngineInterface, text: string): Promise<string[]> {
+  const root = await $.session.root()
+  const blocks: string[] = []
+  let total = 0
+  for (const path of mentionsOf(text).slice(0, MAX_MENTIONS)) {
+    const file = projectPath(root, path)
+    if (file === undefined) continue
+    const stat = await $.fs.stat(file).catch(() => undefined)
+    if (stat?.kind !== 'file' || stat.size > MAX_MENTION_BYTES || total + stat.size > MAX_MENTION_TOTAL) continue
+    const body: unknown = await $.fs.read(file).catch(() => undefined)
+    // Text only: a NUL is a binary file.
+    if (typeof body !== 'string' || body.includes('\u0000')) continue
+    total += stat.size
+    blocks.push(fileContext(path, body))
+  }
+
+  return blocks
+}
+
+async function remoteAction($: EngineInterface, action: string): Promise<string> {
+  if (action === 'stop') {
+    await stopRemote($)
+
+    return 'Remote control stopped.'
+  }
+  if (action === 'start') {
+    await startRemote($)
+    const until = (await $.clock.now()) + REMOTE_START_MS
+    while ((await read($, remote)).status === 'starting' && (await $.clock.now()) < until) await $.clock.sleep(500)
+  }
+
+  return describeRemote(await read($, remote))
+}
+
 export const register: Register = (on, options) => {
   alertMode = alertModeOf(options?.alerts)
   on('session.start', async ($, e, next) => {
@@ -496,13 +752,21 @@ export const register: Register = (on, options) => {
         isDeferred: false,
       })
       .catch(() => undefined)
+    await $.command.register({ name: REMOTE_COMMAND, description: 'Agent Hub: turn remote control from a phone on or off' })
+    await $.tool
+      .register({
+        name: REMOTE,
+        description:
+          'Remote control of this session from another device: start opens a localhost.run link (with a token) to a page ' +
+          'showing the Agent Hub pane, with a box whose prompts go to this session and the latest answer to review. ' +
+          'stop closes it; status says how it stands. Give the person the link it answers.',
+        inputSchema: REMOTE_SCHEMA,
+        isDeferred: true,
+      })
+      .catch(() => undefined)
+    // A reload ended the helper with the module that ran it.
+    await update($, remote, () => ({ status: 'off' }))
     void $.ui.open({ id: PANE, title: TITLE, ...OPEN_SIZE })
-    // A foreground command running when the mod reloaded has no result to
-    // come: it is over as far as the pane can tell. A background one keeps its log.
-    const reloadedAt = await $.clock.now()
-    await update($, shells, list =>
-      list.map(one => (one.status === 'running' && !one.isBackground ? { ...one, status: 'stopped' as const, endedAt: reloadedAt } : one)),
-    ).catch(() => undefined)
     $.clock.every(TICK_MS, () => void tick($).catch(() => undefined))
     // The checklist as it stands when the mod loads; each plan call keeps it current after.
     void $.tool
@@ -534,10 +798,19 @@ export const register: Register = (on, options) => {
   })
 
   // Each prompt the person sends starts a task; a slash command or a prompt
-  // the engine made itself does not, so opening the pane hides nothing.
+  // the engine made itself (a background task's notification, a subagent's
+  // hand-back) does not, so neither opening the pane nor an agent finishing
+  // hides what the person's prompt started.
   on('prompt.submit', async ($, e, next) => {
-    if (e.command === undefined && e.isMeta !== true) {
+    if (e.command === undefined && e.isMeta !== true && isPersonOrigin(e.origin)) {
       await update($, task, n => n + 1).catch(() => undefined)
+    }
+    // A phone prompt's @ files, read before it was submitted.
+    const files = mentioned.get(e.text)
+    if (files !== undefined) {
+      mentioned.delete(e.text)
+
+      return next({ ...e, context: [...(e.context ?? []), ...files] })
     }
 
     return next(e)
@@ -584,9 +857,36 @@ export const register: Register = (on, options) => {
     return { text: 'Agent Hub pane opened.' }
   })
 
+  on('command.run', { command: REMOTE_COMMAND }, async $ => {
+    if (helper !== undefined) {
+      await stopRemote($)
+
+      return { text: 'Agent Hub: remote control stopped.' }
+    }
+    await startRemote($)
+    await $.ui.open({ id: PANE, title: TITLE, ...OPEN_SIZE })
+
+    return { text: 'Agent Hub: remote control starting; the link and its QR code show in the pane.' }
+  })
+
   on('turn.start', async ($, e, next) => {
     const id = e.agentId
-    if (id !== undefined) {
+    if (id === undefined) {
+      isMainBusy = true
+      isHistoryStale = true
+      // A turn a phone's command started is named by the command the phone sent.
+      const prompt = phoneCommand ?? e.text
+      if (phoneCommand !== undefined) turnSinceCommand = true
+      phoneCommand = undefined
+      mentioned.delete(e.text)
+      mainTurn = { prompt, startedAt: await $.clock.now().catch(() => 0) }
+      // A prompt the phone sent has started: it waits no more.
+      const at = queued.indexOf(e.text)
+      if (at >= 0) {
+        queued = queued.filter((_, i) => i !== at)
+        $.ui.invalidate('ui.render')
+      }
+    } else {
       const t = await $.clock.now()
       const current = await read($, task)
       await update($, agents, rows => applyTurnStart(rows, id, t, current))
@@ -599,7 +899,15 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     const id = e.agentId
-    if (id !== undefined) {
+    if (id === undefined) {
+      // The main conversation's answer, for the phone to review.
+      const ended = await next(e)
+      isMainBusy = false
+      isHistoryStale = true
+      lastResult = { prompt: mainTurn?.prompt ?? '', text: ended.text, reason: e.reason, at: await $.clock.now().catch(() => 0) }
+
+      return ended
+    } else {
       const t = await $.clock.now()
       const current = await read($, task)
       await update($, agents, rows => applyTurnComplete(rows, id, e.reason, t, current))
@@ -612,34 +920,27 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // Every Bash call, the main conversation's and each subagent's, is a shell
-  // in the pane. The watching fails quietly; the call's own failure is the call's.
+  // A Bash call that leaves its command running in the background, the main
+  // conversation's or a subagent's, spawned a shell: the pane watches its log
+  // as it watches a subagent. A foreground command is the transcript's.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const t = await $.clock.now().catch(() => 0)
-    const id = e.tool_use_id ?? `shell:${t}`
-    const row: ShellRow = {
-      id,
-      command: String(e.command ?? ''),
-      description: typeof e.description === 'string' && e.description !== '' ? e.description : undefined,
-      agentId: e.agentId,
-      task: await read($, task).catch(() => 0),
-      status: 'running',
-      isBackground: e.run_in_background === true,
-      startedAt: t,
-      tail: [],
+    const ran = await next(e)
+    const spawned = ran.deny === undefined ? spawnedOf(ran.result, ran.text) : undefined
+    if (spawned !== undefined) {
+      const row: ShellRow = {
+        id: e.tool_use_id ?? spawned.taskId,
+        command: String(e.command ?? ''),
+        description: typeof e.description === 'string' && e.description !== '' ? e.description : undefined,
+        agentId: e.agentId,
+        task: await read($, task).catch(() => 0),
+        status: 'running',
+        ...spawned,
+        startedAt: t,
+        tail: [],
+      }
+      await update($, shells, list => startShell(list, row)).catch(() => undefined)
     }
-    await update($, shells, list => startShell(list, row)).catch(() => undefined)
-    // The tasks dir not found yet: the next poll looks for it.
-    if (tasksDir === undefined) polls = 0
-    let ran: ToolCallResult
-    try {
-      ran = await next(e)
-    } catch (error) {
-      const ended = await $.clock.now().catch(() => t)
-      await update($, shells, list => patchRunning(list, id, { status: 'stopped', endedAt: ended })).catch(() => undefined)
-      throw error
-    }
-    await settleShell($, id, ran).catch(() => undefined)
 
     return ran
   })
@@ -686,6 +987,13 @@ export const register: Register = (on, options) => {
       const saved = `Checklist saved (${plural(count, 'item')}); the person sees it in the Agent Hub pane.`
 
       return { result: saved, text: saved }
+    }
+
+    // Remote control, this mod's other tool.
+    if (tool === REMOTE_TOOL) {
+      const said = await remoteAction($, String(args.action ?? 'status'))
+
+      return { result: said, text: said }
     }
 
     // Logs the call as a step of `key` in `log`, running until the call settles.
@@ -771,6 +1079,7 @@ export const register: Register = (on, options) => {
     const logs = await read($, taskLogs)
     const shellRows = await read($, shells)
     const currentPrompt = await read($, task)
+    const remoteState = await read($, remote)
     // The list keeps to the latest task unless the person asked for all;
     // the detail view still finds any agent's children.
     const allLines = visibleTree(rows)
@@ -1293,9 +1602,9 @@ export const register: Register = (on, options) => {
         </Text>
       )
 
-    // The shells: one terminal a lane, its command pinned on top, its log's
-    // latest lines under it, as a terminal scrolls; the lane's next command
-    // takes its place. A running card keeps its height as its log grows.
+    // The spawned shells, one card each: the command pinned on top, its log's
+    // latest lines under it as a terminal scrolls. A running card keeps its
+    // height as its log grows.
     const shownShells = visibleShells(shellRows, currentPrompt)
     const shellsRunning = shellRows.filter(one => one.status === 'running').length
     const shellTime = (one: ShellRow) => formatElapsed(Math.max(0, (one.endedAt ?? Math.max(t, one.startedAt)) - one.startedAt))
@@ -1333,7 +1642,7 @@ export const register: Register = (on, options) => {
           { text: isRunning ? frame : SHELL_GLYPH[one.status], color: SHELL_COLOR[one.status] },
           { text: ` ${one.description ?? 'shell'}`, color: 'text', bold: isRunning },
         ]),
-        right: dimmed([{ text: `${owner}${one.isBackground ? ' · bg' : ''} · ${shellTime(one)}${end}`, color: 'text' }]),
+        right: dimmed([{ text: `${owner} · ${shellTime(one)}${end}`, color: 'text' }]),
       }
 
       return (
@@ -1351,6 +1660,68 @@ export const register: Register = (on, options) => {
             </Text>
           </Text>
           {shownShells.map(shellCard)}
+        </Box>
+      )
+
+    // Remote control while it is on: the link to open on the phone, or how
+    // the start goes.
+    const remoteLabel = {
+      off: '',
+      starting: 'starting…',
+      on: queued.length > 0 ? `on · ${plural(queued.length, 'prompt')} waiting` : 'on',
+      error: 'failed',
+    }[remoteState.status]
+    // The link as a QR code for the phone's camera, centred in the pane: light
+    // on dark whatever the theme, and only whole, as a wrapped code does not scan.
+    const qr = remoteState.link === undefined || remoteState.isQrHidden === true ? [] : qrOf(remoteState.link)
+    const remoteQr =
+      qr.length === 0 ? null : [...qr[0]!].length > columns ? (
+        <Text dimColor>widen the pane to show the QR code</Text>
+      ) : (
+        <Box flexDirection="row" justifyContent="center" width={Math.max(1, columns)}>
+          <Text color="#ffffff" backgroundColor="#000000">
+            {qr.join('\n')}
+          </Text>
+        </Box>
+      )
+    const remoteGroup =
+      remoteState.status === 'off' ? null : (
+        <Box flexDirection="column">
+          <Text>
+            <Text bold>
+              <Text color={TITLE_COLOR}>Remote</Text>:{' '}
+            </Text>
+            <Text color={remoteState.status === 'error' ? 'error' : remoteState.status === 'on' ? 'success' : undefined}>
+              {remoteLabel}
+            </Text>
+          </Text>
+          {remoteState.link !== undefined && <Text>{remoteState.link}</Text>}
+          {remoteQr}
+          {remoteState.note !== undefined && <Text color="warning">{remoteState.note}</Text>}
+          <Box flexDirection="row" columnGap={3}>
+            {remoteState.link !== undefined && (
+              <Button
+                key="remote-qr"
+                plain
+                label={remoteState.isQrHidden === true ? 'show QR' : 'hide QR'}
+                onPress={() => update($, remote, state => ({ ...state, isQrHidden: state.isQrHidden !== true }))}
+              />
+            )}
+            {remoteState.link !== undefined && (
+              <Button
+                key="remote-copy"
+                plain
+                label="copy link"
+                onPress={press => void $.ui.copy({ text: remoteState.link ?? '', surface: press.surface })}
+              />
+            )}
+            <Button
+              key="remote-stop"
+              plain
+              label={remoteState.status === 'error' ? 'dismiss' : 'stop remote'}
+              onPress={() => (helper === undefined ? update($, remote, () => ({ status: 'off' })) : stopRemote($))}
+            />
+          </Box>
         </Box>
       )
 
@@ -1487,6 +1858,8 @@ export const register: Register = (on, options) => {
           )}
           {shellGroup === null ? null : rule}
           {shellGroup}
+          {remoteGroup === null ? null : rule}
+          {remoteGroup}
         </Box>
         {usageGroup === null ? null : rule}
         {usageGroup}
