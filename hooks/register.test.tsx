@@ -853,48 +853,43 @@ function tasksDir(on: On) {
   return files
 }
 
-test('a running shell pins its command over its log; the next command takes its place', async ($, on) => {
+test("the main conversation's foreground commands are the transcript's, not a shell", async ($, on) => {
+  const { clock } = engine(on)
+  tasksDir(on)
+  on('tool.call', () => ({ result: { stdout: 'clean', stderr: '', interrupted: false }, text: 'clean' }))
+  const ui = await $.ui.mount({ plugin: 'agent-hub', surface: 'terminal', component: 'Pane', requestId: 'agent-hub', props: PANE_PROPS })
+
+  await $.tool.call({ tool: 'Bash', command: 'git status', tool_use_id: 'u1' } as never)
+  await clock.advance(2000)
+  await clock.settle()
+  expect(await ui.find({ type: 'Text', text: /^Shells/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'git status' })).toBeUndefined()
+
+  await ui.unmount()
+})
+
+test('a command moved to the background mid-run becomes a shell, its log found in the tasks dir', async ($, on) => {
   const { clock } = engine(on)
   const files = tasksDir(on)
   const start = starts(on)
-  files['bold.output'] = { text: 'from before\n', mtimeMs: 1 }
-  const calls: Record<string, () => void> = {}
-  on('tool.call', async (_$, e) => {
-    const id = String(e.tool_use_id)
-    await new Promise<void>(resolve => (calls[id] = resolve))
-
-    return { result: { stdout: id === 'u1' ? 'compiled\n3 passed\n' : 'clean', stderr: '', interrupted: false }, text: 'ok' }
-  })
+  on('tool.call', () => ({
+    result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bbuild', backgroundedByUser: true },
+    text: 'Command was manually backgrounded by user with ID: bbuild.',
+  }))
   await start($)
   const ui = await $.ui.mount({ plugin: 'agent-hub', surface: 'terminal', component: 'Pane', requestId: 'agent-hub', props: PANE_PROPS })
 
-  const first = $.tool.call({ tool: 'Bash', command: 'npm test', description: 'Run the tests', tool_use_id: 'u1' } as never)
-  await clock.settle()
-  files['bfirst.output'] = { text: 'compiled\n\x1b[32m2 passed\x1b[0m\n', mtimeMs: 2_000_000 }
+  await $.tool.call({ tool: 'Bash', command: 'npm run build', description: 'Build the app', tool_use_id: 'u1' } as never)
+  files['bbuild.output'] = { text: 'compiled\n\x1b[32m12 modules\x1b[0m\n', mtimeMs: 2_000_000 }
   await clock.advance(2000)
   await clock.settle()
 
   expect(await ui.find({ type: 'Text', text: /^Shells: 1 running · 0 done$/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: ' Run the tests' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'npm test' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: '2 passed' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'from before' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: ' Build the app' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'npm run build' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '12 modules' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^main · / })).toBeDefined()
 
-  calls.u1!()
-  await first
-  delete files['bfirst.output']
-  await clock.settle()
-  expect(await ui.find({ type: 'Text', text: '3 passed' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^Shells: 0 running · 1 done$/ })).toBeDefined()
-
-  const second = $.tool.call({ tool: 'Bash', command: 'git status', tool_use_id: 'u2' } as never)
-  await clock.settle()
-  expect(await ui.find({ type: 'Text', text: 'git status' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'npm test' })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: 'waiting for output…' })).toBeDefined()
-
-  calls.u2!()
-  await second
   await ui.unmount()
 })
 
@@ -916,7 +911,7 @@ test("a background shell runs until its log's exit line, under the agent that st
   await clock.advance(2000)
   await clock.settle()
   expect(await ui.find({ type: 'Text', text: 'ready on :3000' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /^Explore · bg · / })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Explore · / })).toBeDefined()
 
   files['bsrv.output'] = { text: 'ready on :3000\nEADDRINUSE\n\n[exited with code 1]\n', mtimeMs: 2_001_000 }
   await clock.advance(2000)
@@ -938,11 +933,25 @@ test('no shell yet, no Shells group', async ($, on) => {
 
 test('enter on a shell opens it whole: its command, every line it keeps, and back', async ($, on) => {
   const { clock } = engine(on)
+  const files = tasksDir(on)
+  const start = starts(on)
   const printed = Array.from({ length: 8 }, (_, i) => `step ${i + 1}`).join('\n')
-  on('tool.call', () => ({ result: { stdout: `${printed}\n`, stderr: '', interrupted: false }, text: 'ok' }))
+  on('tool.call', () => ({
+    result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bsteps' },
+    text: 'Command running in background with ID: bsteps.',
+  }))
+  await start($)
   const ui = await $.ui.mount({ plugin: 'agent-hub', surface: 'terminal', component: 'Pane', requestId: 'agent-hub', props: PANE_PROPS })
 
-  await $.tool.call({ tool: 'Bash', command: 'cd app &&\n  ./run.sh --token=abc123', description: 'Run the steps', tool_use_id: 'u1' } as never)
+  await $.tool.call({
+    tool: 'Bash',
+    command: 'cd app &&\n  ./run.sh --token=abc123',
+    description: 'Run the steps',
+    run_in_background: true,
+    tool_use_id: 'u1',
+  } as never)
+  files['bsteps.output'] = { text: `${printed}\n\n[exited with code 0]\n`, mtimeMs: 2_000_000 }
+  await clock.advance(2000)
   await clock.settle()
   // The card draws a finished command's last two lines.
   expect(await ui.find({ type: 'Text', text: 'step 8' })).toBeDefined()
@@ -955,7 +964,7 @@ test('enter on a shell opens it whole: its command, every line it keeps, and bac
   expect(await ui.find({ type: 'Text', text: 'cd app &&' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: './run.sh --token=***' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /abc123/ })).toBeUndefined()
-  // A foreground command offers no stop.
+  // A shell that has exited offers no stop.
   expect(await ui.find({ key: 'stop' })).toBeUndefined()
 
   await ui.press({ key: 'back' })
@@ -964,16 +973,25 @@ test('enter on a shell opens it whole: its command, every line it keeps, and bac
   await ui.unmount()
 })
 
-test('a shell the next command took the place of is still in the detail, and opens', async ($, on) => {
+test('the detail lists every shell of the session, newest first, each one opening', async ($, on) => {
   const { clock } = engine(on)
-  on('tool.call', (_$, e) => ({ result: { stdout: `out of ${String(e.tool_use_id)}\n`, stderr: '', interrupted: false }, text: 'ok' }))
+  const files = tasksDir(on)
+  const start = starts(on)
+  on('tool.call', (_$, e) => {
+    const id = `b${String(e.tool_use_id)}`
+
+    return { result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: id }, text: `Command running in background with ID: ${id}.` }
+  })
+  await start($)
   const ui = await $.ui.mount({ plugin: 'agent-hub', surface: 'terminal', component: 'Pane', requestId: 'agent-hub', props: PANE_PROPS })
 
-  await $.tool.call({ tool: 'Bash', command: 'npm run build', description: 'Build', tool_use_id: 'u1' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'npm run build', description: 'Build', run_in_background: true, tool_use_id: 'u1' } as never)
+  files['bu1.output'] = { text: 'out of u1\n', mtimeMs: 2_000_000 }
   await clock.advance(1000)
-  await $.tool.call({ tool: 'Bash', command: 'npm test', description: 'Test', tool_use_id: 'u2' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'npm test', description: 'Test', run_in_background: true, tool_use_id: 'u2' } as never)
+  files['bu2.output'] = { text: 'out of u2\n', mtimeMs: 2_000_000 }
+  await clock.advance(2000)
   await clock.settle()
-  expect(await ui.find({ key: 'shell:u1' })).toBeUndefined()
 
   await ui.press({ key: 'shell:u2' })
   const listed = (await ui.findAll({ type: 'Button' })).map(one => one.key).filter(key => key?.startsWith('history:'))
@@ -985,7 +1003,7 @@ test('a shell the next command took the place of is still in the detail, and ope
   await ui.unmount()
 })
 
-test('a background command stops from its detail on a second press of s', async ($, on) => {
+test('a running shell stops from its detail on a second press of s', async ($, on) => {
   const { clock } = engine(on)
   const stops: unknown[] = []
   on('tool.call', (_$, e) => {
@@ -1018,8 +1036,8 @@ test('a background command stops from its detail on a second press of s', async 
 
 test('with no agent card, the focus ring starts on the first shell', async ($, on) => {
   const { clock } = engine(on)
-  on('tool.call', () => ({ result: { stdout: 'ok\n', stderr: '', interrupted: false }, text: 'ok' }))
-  await $.tool.call({ tool: 'Bash', command: 'ls', tool_use_id: 'u1' } as never)
+  on('tool.call', () => ({ result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bls' }, text: 'Command running in background with ID: bls.' }))
+  await $.tool.call({ tool: 'Bash', command: 'ls', run_in_background: true, tool_use_id: 'u1' } as never)
   await clock.settle()
   const ui = await $.ui.mount({ plugin: 'agent-hub', surface: 'terminal', component: 'Pane', requestId: 'agent-hub', props: PANE_PROPS })
 
@@ -1027,32 +1045,21 @@ test('with no agent card, the focus ring starts on the first shell', async ($, o
   expect(focused.map(one => one.key)).toEqual(['shell:u1'])
 })
 
-test('a shell whose log the pane cannot find says so, then shows the output at its end', async ($, on) => {
+test('a shell whose log the pane cannot find says so after the grace, on its card and in its detail', async ($, on) => {
   const { clock } = engine(on)
-  let finish = () => {}
-  on('tool.call', async () => {
-    await new Promise<void>(resolve => (finish = resolve))
-
-    return { result: { stdout: 'built\n', stderr: '', interrupted: false }, text: 'ok' }
-  })
-  // No tasks dir to be found: no fs hook answers.
+  // The result names no log, and no tasks dir is to be found: no fs hook answers.
+  on('tool.call', () => ({ result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bbuild' }, text: 'Command running in background.' }))
   const start = starts(on)
   await start($)
   const ui = await $.ui.mount({ plugin: 'agent-hub', surface: 'terminal', component: 'Pane', requestId: 'agent-hub', props: PANE_PROPS })
 
-  const ran = $.tool.call({ tool: 'Bash', command: 'npm run build', tool_use_id: 'u1' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'npm run build', run_in_background: true, tool_use_id: 'u1' } as never)
   await clock.settle()
   expect(await ui.find({ type: 'Text', text: 'waiting for output…' })).toBeDefined()
 
   await clock.advance(11_000)
-  expect(await ui.find({ type: 'Text', text: 'live output unavailable · shown when it ends' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'live output unavailable · its log was not found' })).toBeDefined()
   await ui.press({ key: 'shell:u1' })
-  expect(await ui.find({ type: 'Text', text: 'live output unavailable · shown when it ends' })).toBeDefined()
-
-  finish()
-  await ran
-  await clock.settle()
-  expect(await ui.find({ type: 'Text', text: 'built' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /live output unavailable/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'live output unavailable · its log was not found' })).toBeDefined()
   await ui.unmount()
 })
